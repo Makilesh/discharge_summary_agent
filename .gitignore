@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+output/
+*.egg-info/
+patient2_*.txt
+assignment_text.txt

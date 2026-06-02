@@ -1,0 +1,816 @@
+"""
+tools.py — Tool Functions for Clinical Data Extraction
+========================================================
+
+Each tool wraps a Gemini Vision LLM call with structured prompting.
+Tools are the agent's interface to the patient documents.
+
+Clinical Safety:
+    - Every tool returns structured data or None — never fabricated values.
+    - safe_tool_call() enforces max 2 retries before marking [UNRESOLVED].
+    - LLM calls use temperature=0.0 for deterministic extraction.
+    - All tool outputs are logged in the trace for audit.
+"""
+
+from __future__ import annotations
+import json
+import re
+from typing import Optional, Callable, Any
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage
+
+from .config import (
+    GOOGLE_API_KEY, LLM_MODEL, LLM_TEMPERATURE,
+    DOC_TYPES, MAX_RETRIES, MIN_TEXT_LENGTH,
+)
+from .trace import emit_trace
+
+
+# ─── LLM SINGLETON ──────────────────────────────────────────────────────────────
+
+_llm: Optional[ChatGoogleGenerativeAI] = None
+
+
+def get_llm() -> ChatGoogleGenerativeAI:
+    """Get or create the Gemini Vision LLM instance."""
+    global _llm
+    if _llm is None:
+        _llm = ChatGoogleGenerativeAI(
+            model=LLM_MODEL,
+            google_api_key=GOOGLE_API_KEY,
+            temperature=LLM_TEMPERATURE,
+            max_output_tokens=8192,
+        )
+    return _llm
+
+
+def _call_vision_llm(prompt: str, image_b64_list: list[str]) -> str:
+    """
+    Call Gemini Vision with text prompt and one or more page images.
+    
+    Returns the raw text response from the LLM.
+    Raises exception on API failure (handled by safe_tool_call).
+    """
+    llm = get_llm()
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for img_b64 in image_b64_list:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+        })
+    msg = HumanMessage(content=content)
+    response = llm.invoke([msg])
+    return response.content
+
+
+def _parse_json_response(response_text: str) -> dict | list:
+    """
+    Extract JSON from LLM response, handling markdown code fences.
+    
+    Clinical Safety: Returns empty dict on parse failure — never invents data.
+    """
+    # Strip markdown code fences if present
+    text = response_text.strip()
+    if text.startswith("```"):
+        # Remove opening fence (```json or ```)
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        # Remove closing fence
+        text = re.sub(r"\n?```\s*$", "", text)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Try to find JSON object/array in the text
+        json_match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', text)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+        return {}
+
+
+# ─── TOOL: CLASSIFY DOCUMENT PAGES ──────────────────────────────────────────────
+
+def classify_document_pages(
+    page_images_b64: list[tuple[int, str]],
+) -> list[dict]:
+    """
+    Classify multiple pages into the DOC_TYPES taxonomy in a single LLM call.
+
+    Purpose:
+        Batch-classifies pages to build the document inventory efficiently.
+        This is the first step in the extraction pipeline.
+
+    Clinical Safety:
+        - Pages classified as UNKNOWN with confidence < 0.5 must be logged
+          in unreadable_pages and mentioned in pending_results.
+        - Confidence scores enable downstream quality gates.
+
+    Args:
+        page_images_b64: List of (page_num, base64_image) tuples.
+
+    Returns:
+        List of {page_num, doc_type, confidence} dicts.
+    """
+    doc_types_str = "\n".join(f"- {dt}" for dt in DOC_TYPES)
+    page_nums = [p[0] for p in page_images_b64]
+
+    prompt = f"""You are a clinical document classifier. Classify each page of this hospital patient record.
+
+For each page image provided, identify the document type from this taxonomy:
+{doc_types_str}
+
+The pages are numbered: {page_nums}
+
+Return a JSON array with one entry per page:
+[
+    {{"page_num": <int>, "doc_type": "<string from taxonomy>", "confidence": <float 0.0-1.0>}}
+]
+
+Rules:
+- If a page is mostly illegible or blank, classify as "UNKNOWN" with low confidence.
+- If a page contains multiple types, classify by the PRIMARY content type.
+- Handwritten pages should still be classified by their form type (e.g., nursing notes, drug chart).
+- Be specific: prefer "LAB_REPORT_BIOCHEMISTRY" over generic "LAB_REPORT" when distinguishable.
+
+Return ONLY the JSON array, no other text."""
+
+    images = [img for _, img in page_images_b64]
+    response = _call_vision_llm(prompt, images)
+    parsed = _parse_json_response(response)
+
+    if isinstance(parsed, list):
+        return parsed
+    return []
+
+
+# ─── TOOL: EXTRACT PAGE TEXT (OCR) ──────────────────────────────────────────────
+
+def extract_page_text(image_b64: str, page_num: int) -> dict:
+    """
+    Extract all text from a single scanned page using Gemini Vision OCR.
+
+    Purpose:
+        Full OCR extraction of a page, including handwritten text.
+        Returns both the extracted text and a confidence estimate.
+
+    Clinical Safety:
+        - Always attempts full extraction even when confidence is low.
+        - Preserves ambiguous readings with [UNCLEAR: best_guess] annotations.
+        - For drug names, emits [DRUG NAME PARTIALLY LEGIBLE: ...] annotations.
+        - Never silently drops content.
+
+    Returns:
+        {"text": str, "confidence": float, "page_num": int}
+        On failure: {"text": "", "confidence": 0.0, "page_num": page_num}
+    """
+    prompt = f"""You are a clinical document OCR system. Extract ALL text from this scanned hospital page (Page {page_num}).
+
+Rules:
+1. Extract EVERY piece of text visible, including handwritten notes, printed text, stamps, and filled form fields.
+2. Preserve the original structure (tables, columns, headers) as much as possible using plain text formatting.
+3. For partially legible text, use: [UNCLEAR: your_best_guess]
+4. For partially legible drug names, use: [DRUG NAME PARTIALLY LEGIBLE: "what_you_read" — likely actual_drug_name. Verify against drug chart.]
+5. For dates, always try dd/mm/yy and dd/mm/yyyy format. Note any format ambiguity.
+6. Do NOT skip any section even if it appears blank — note "[SECTION APPEARS BLANK]" instead.
+7. For tables, preserve column alignment and headers.
+8. Note any stamps, signatures, or checkmarks.
+
+After the extracted text, add a final line:
+EXTRACTION_CONFIDENCE: <0.0-1.0>
+
+Where 1.0 = fully legible typed text, 0.5 = partially legible, 0.0 = completely illegible."""
+
+    response = _call_vision_llm(prompt, [image_b64])
+
+    # Parse confidence from response
+    confidence = 0.5  # Default
+    conf_match = re.search(r'EXTRACTION_CONFIDENCE:\s*([\d.]+)', response)
+    if conf_match:
+        try:
+            confidence = float(conf_match.group(1))
+        except ValueError:
+            pass
+
+    # Remove confidence line from text
+    text = re.sub(r'\nEXTRACTION_CONFIDENCE:.*$', '', response, flags=re.MULTILINE).strip()
+
+    return {
+        "text": text,
+        "confidence": confidence,
+        "page_num": page_num,
+    }
+
+
+# ─── TOOL: EXTRACT TYPED DISCHARGE SUMMARY ──────────────────────────────────────
+
+def extract_typed_summary(text: str, page_num: int) -> dict:
+    """
+    Parse the structured typed discharge summary block.
+
+    Purpose:
+        The typed discharge summary is the anchor document — it provides
+        demographics, dates, and official diagnoses to cross-reference
+        against all other documents.
+
+    Clinical Safety:
+        - Fields not found must be returned as None, never guessed.
+        - Diagnoses must be extracted exactly as written — no paraphrasing.
+        - This is the PRIMARY source for demographics and dates.
+
+    Returns:
+        {"demographics": dict, "diagnoses": dict, "medications": list,
+         "follow_up": list, "condition_at_discharge": str}
+    """
+    prompt = f"""You are a clinical data extractor. Parse this typed discharge summary (Page {page_num}).
+
+Extract the following into a JSON object:
+{{
+    "demographics": {{
+        "name": "<patient name or null>",
+        "age": "<age or null>",
+        "gender": "<gender or null>",
+        "mrn": "<MRN number or null>",
+        "ip_no": "<IP number or null>",
+        "blood_group": "<blood group or null>",
+        "weight": "<weight or null>",
+        "address": "<address or null>"
+    }},
+    "admission_date": "<dd/mm/yyyy or null>",
+    "discharge_date": "<dd/mm/yyyy or null>",
+    "diagnoses": {{
+        "principal": ["<exact text>"],
+        "secondary": ["<exact text>"],
+        "provisional": ["<exact text>"],
+        "final": ["<exact text>"]
+    }},
+    "chief_complaints": ["<exact text>"],
+    "past_history": "<exact text or null>",
+    "medications": [
+        {{
+            "name": "<drug name>",
+            "dose": "<dose or null>",
+            "route": "<route or null>",
+            "frequency": "<frequency or null>"
+        }}
+    ],
+    "follow_up": ["<instruction>"],
+    "condition_at_discharge": "<exact text or null>",
+    "allergies": ["<allergy or 'NOT KNOWN'>"]
+}}
+
+Rules:
+- Extract EXACTLY what is written. Do not paraphrase or infer.
+- If a field is not present, set it to null.
+- For diagnoses, capture ALL diagnosis entries, distinguishing provisional from final.
+- For medications, capture every single medication listed.
+- Preserve original spelling and abbreviations.
+
+SOURCE TEXT:
+{text}
+
+Return ONLY the JSON object."""
+
+    response = _call_vision_llm(prompt, [])
+    return _parse_json_response(response)
+
+
+# ─── TOOL: EXTRACT CLINICAL DATA FROM ANY PAGE ─────────────────────────────────
+
+def extract_clinical_data(
+    text: str,
+    page_num: int,
+    doc_type: str,
+    image_b64: Optional[str] = None,
+) -> dict:
+    """
+    Extract structured clinical data from any classified page.
+
+    Purpose:
+        Generic extraction tool that adapts its prompt based on document type.
+        Handles admission records, ER charts, ICU charts, consultation sheets,
+        nursing notes, monitoring charts, and procedure charts.
+
+    Clinical Safety:
+        - Every diagnosis must include the source document type.
+        - Medications must include dates and routes when visible.
+        - Nursing note events must be timestamped.
+        - Hospital course sentences must include source page references.
+
+    Returns:
+        Dict with extracted fields relevant to the document type.
+    """
+    type_specific_instructions = _get_extraction_instructions(doc_type)
+
+    prompt = f"""You are a clinical data extractor. Extract structured data from this {doc_type} page (Page {page_num}).
+
+{type_specific_instructions}
+
+SOURCE TEXT:
+{text}
+
+Return a JSON object with the extracted data. Use null for fields not found.
+Do NOT invent or infer any clinical facts not explicitly present in the text.
+If text is partially legible, use [UNCLEAR: best_guess] annotations."""
+
+    images = [image_b64] if image_b64 else []
+    response = _call_vision_llm(prompt, images)
+    result = _parse_json_response(response)
+    if isinstance(result, dict):
+        result["source_page"] = page_num
+        result["source_type"] = doc_type
+    return result
+
+
+def _get_extraction_instructions(doc_type: str) -> str:
+    """Get document-type-specific extraction instructions."""
+    instructions = {
+        "ADMISSION_RECORD": """Extract:
+{
+    "chief_complaints": ["<symptom>"],
+    "history_of_present_illness": "<text>",
+    "past_history": "<text or null>",
+    "provisional_diagnosis": ["<diagnosis>"],
+    "final_diagnosis": ["<diagnosis>"],
+    "examination_findings": "<text or null>",
+    "allergies": ["<allergy or 'NOT KNOWN'>"]
+}""",
+        "ER_OBSERVATION_CHART": """Extract:
+{
+    "arrival_time": "<time or null>",
+    "er_diagnosis": ["<diagnosis>"],
+    "chief_complaints": ["<symptom>"],
+    "vitals": {"bp": "", "pulse": "", "temp": "", "spo2": "", "rr": ""},
+    "treatments_given": [{"drug": "", "dose": "", "route": "", "time": ""}],
+    "disposition": "<admitted/discharged/transferred or null>"
+}""",
+        "ICU_CHART": """Extract:
+{
+    "icu_diagnoses": ["<diagnosis as written on chart header>"],
+    "medications": [{"name": "", "dose": "", "route": "", "frequency": "", "date": ""}],
+    "vitals_timeline": [{"time": "", "bp": "", "pulse": "", "temp": "", "spo2": ""}],
+    "iv_fluids": [{"fluid": "", "rate": "", "duration": ""}],
+    "ventilator_settings": "<if applicable, null otherwise>",
+    "io_balance": "<intake/output summary or null>"
+}""",
+        "CONSULTATION_SHEET": """Extract:
+{
+    "consultation_date": "<date or null>",
+    "consulting_doctor": "<name or null>",
+    "specialty": "<specialty or null>",
+    "consultation_diagnosis": ["<diagnosis>"],
+    "recommendations": ["<recommendation>"],
+    "discharge_plan": "<text or null>"
+}""",
+        "DRUG_CHART": """Extract ALL medications visible on this drug chart page:
+{
+    "medications": [
+        {
+            "name": "<drug name>",
+            "dose": "<dose>",
+            "route": "<PO/IV/SC/IM/etc>",
+            "frequency": "<OD/BD/TID/QID/SOS/etc>",
+            "start_date": "<date or null>",
+            "stop_date": "<date or null>",
+            "dates_administered": ["<date1>", "<date2>"],
+            "signatures_present": true/false
+        }
+    ],
+    "chart_date_range": {"from": "<date>", "to": "<date>"}
+}
+IMPORTANT: Extract EVERY drug entry. Do not skip any row. Include PRN/SOS medications.
+For column headers showing dates (D1, D2, D3...), map them to calendar dates if a start date is visible.""",
+        "NURSING_NOTES": """Extract timestamped nursing events:
+{
+    "events": [
+        {
+            "timestamp": "<date and time>",
+            "event_type": "<assessment/medication/procedure/observation/vital_sign>",
+            "description": "<exact text of the note>",
+            "medications_mentioned": ["<drug names mentioned>"],
+            "vitals_mentioned": {"bp": "", "pulse": "", "temp": "", "spo2": ""}
+        }
+    ]
+}
+IMPORTANT: Preserve chronological order. Include ALL entries even if partially legible.""",
+        "NURSING_ASSESSMENT": """Extract:
+{
+    "assessment_date": "<date>",
+    "patient_condition": "<text>",
+    "pain_score": "<score or null>",
+    "fall_risk": "<score or null>",
+    "pressure_ulcer_risk": "<score or null>",
+    "diet": "<text or null>",
+    "mobility": "<text or null>",
+    "consciousness": "<text or null>"
+}""",
+        "MONITORING_CHART_DIABETES": """Extract ALL blood glucose readings and insulin doses:
+{
+    "readings": [
+        {
+            "date": "<date>",
+            "time": "<time or period: BL/BB/BL/BD/HS/3AM>",
+            "glucose_value": <number>,
+            "glucose_unit": "mg/dL",
+            "insulin_type": "<Regular/Lantus/Actrapid/etc or null>",
+            "insulin_dose": "<dose or null>",
+            "insulin_route": "<SC/IV or null>"
+        }
+    ]
+}
+CRITICAL: Extract EVERY reading. These are forensic evidence for DKA/uncontrolled DM.""",
+        "MONITORING_CHART_VITALS": """Extract all vital sign readings:
+{
+    "readings": [
+        {
+            "date": "<date>",
+            "time": "<time>",
+            "bp_systolic": <number or null>,
+            "bp_diastolic": <number or null>,
+            "pulse": <number or null>,
+            "temperature": <number or null>,
+            "spo2": <number or null>,
+            "respiratory_rate": <number or null>
+        }
+    ]
+}""",
+        "DISCHARGE_CHECKLIST": """Extract:
+{
+    "discharge_type": "<routine/against_medical_advice/on_request/null>",
+    "pending_items": ["<item>"],
+    "patient_education_done": true/false/null,
+    "follow_up_appointments": ["<appointment>"],
+    "discharge_condition": "<text or null>"
+}""",
+    }
+
+    # Default for lab/imaging types
+    default = """Extract all data present on this page into a structured JSON format.
+Include all fields, values, dates, and reference ranges visible.
+Use null for missing values. Never invent data."""
+
+    return instructions.get(doc_type, default)
+
+
+# ─── TOOL: EXTRACT LAB REPORT ──────────────────────────────────────────────────
+
+def extract_lab_report(text: str, page_num: int, report_type: str) -> dict:
+    """
+    Parse any lab report page. Detect abnormals against reference range.
+
+    Purpose:
+        Extracts every lab result with value, unit, reference range, date,
+        and abnormal flag. Critical for CR-3 audit.
+
+    Clinical Safety:
+        - Must flag: result outside reference range (abnormal=True).
+        - Must note: "PENDING" or "AWAITED" results verbatim.
+        - Must NOT: interpolate a result if the value cell is blank.
+        - Critical labs (Na, K, glucose, creatinine, pH, HCO3, WBC) are
+          individually flagged per spec.
+
+    Returns:
+        {"results": [{"test", "value", "unit", "ref_range", "date", "abnormal_flag"}]}
+    """
+    prompt = f"""You are a clinical lab result parser. Extract ALL lab results from this {report_type} report (Page {page_num}).
+
+Return a JSON object:
+{{
+    "report_date": "<date or null>",
+    "results": [
+        {{
+            "test_name": "<full test name>",
+            "result_value": "<value as string, or 'PENDING' or 'AWAITED'>",
+            "unit": "<unit or null>",
+            "reference_range": "<range as string or null>",
+            "date": "<date of test or null>",
+            "abnormal_flag": true/false,
+            "critically_abnormal": true/false
+        }}
+    ]
+}}
+
+Rules:
+- Extract EVERY result row, even if the value appears normal.
+- If a value is outside the reference range, set abnormal_flag=true.
+- If a value is DANGEROUSLY outside the range (e.g., Na < 120, K > 6.5, glucose > 400, pH < 7.25), set critically_abnormal=true.
+- If a value cell is blank or unreadable, set result_value to null. Do NOT guess.
+- If the result says "PENDING", "AWAITED", or similar, record it exactly.
+- Preserve original units and reference ranges exactly as printed.
+
+SOURCE TEXT:
+{text}
+
+Return ONLY the JSON object."""
+
+    response = _call_vision_llm(prompt, [])
+    return _parse_json_response(response)
+
+
+# ─── TOOL: EXTRACT DRUG CHART (BATCH) ──────────────────────────────────────────
+
+def extract_drug_chart_batch(
+    page_texts: list[tuple[int, str]],
+    page_images: Optional[list[tuple[int, str]]] = None,
+) -> dict:
+    """
+    Parse multiple drug chart pages in a single batch call.
+
+    Purpose:
+        Drug charts typically span 2-3 pages. Batch processing saves agent
+        steps and allows cross-page medication timeline reconstruction.
+
+    Clinical Safety:
+        - Must extract EVERY medication entry. No silent drops.
+        - Must map column headers (D1, D2, D3...) to calendar dates.
+        - Must detect medications present in inpatient charts but absent
+          from discharge — potential CR-1 violation.
+
+    Returns:
+        {"medications": [MedicationEntry-like dicts]}
+    """
+    combined_text = "\n\n".join(
+        f"--- PAGE {pn} ---\n{text}" for pn, text in page_texts
+    )
+
+    prompt = f"""You are a clinical drug chart parser. Extract ALL medications from these drug chart pages.
+
+Return a JSON object:
+{{
+    "medications": [
+        {{
+            "name": "<drug name>",
+            "dose": "<dose or null>",
+            "route": "<PO/IV/SC/IM/etc or null>",
+            "frequency": "<OD/BD/TID/QID/SOS/etc or null>",
+            "start_date": "<date or null>",
+            "stop_date": "<date or null>",
+            "status": "<ADMISSION|INPATIENT_ONLY|DISCHARGE|UNKNOWN>",
+            "change_reason": "<reason for starting/stopping or null>",
+            "change_reason_documented": true/false,
+            "source_pages": [<page numbers>]
+        }}
+    ],
+    "chart_date_range": {{"from": "<date>", "to": "<date>"}},
+    "notes": "<any important notes about the drug chart>"
+}}
+
+Rules:
+- Extract EVERY medication. Do not skip any row, even PRN/SOS.
+- Map D1/D2/D3 columns to actual calendar dates using any date hints visible.
+- If a drug has tick marks on certain days but not others, note the specific dates.
+- For partially legible drug names: [DRUG NAME PARTIALLY LEGIBLE: "what_you_read" — likely actual_name]
+- Set status to INPATIENT_ONLY if the drug only appears during hospital stay.
+- Set change_reason_documented to false if no reason is written for starting or stopping a drug.
+
+SOURCE TEXT:
+{combined_text}
+
+Return ONLY the JSON object."""
+
+    images = [img for _, img in (page_images or [])]
+    response = _call_vision_llm(prompt, images)
+    return _parse_json_response(response)
+
+
+# ─── TOOL: RECONCILE MEDICATIONS ────────────────────────────────────────────────
+
+def reconcile_medications(
+    admission: list[dict],
+    inpatient: list[dict],
+    discharge: list[dict],
+) -> dict:
+    """
+    Compare admission vs inpatient vs discharge medications. Flag all changes.
+
+    Purpose:
+        Medication reconciliation is a critical safety check. Every change
+        (added, stopped, dose changed) must be surfaced with a reason
+        or flagged for clinician review.
+
+    Clinical Safety:
+        - A medication in inpatient but absent from discharge MUST be flagged
+          as potentially omitted (CR-1 check).
+        - A medication added without documented reason MUST be flagged.
+        - A medication stopped without documented reason MUST be flagged.
+        - This function NEVER resolves discrepancies — it reports them.
+
+    Returns:
+        {"reconciliation": [dict], "flags": [ClinicalFlag-like dicts]}
+    """
+    reconciliation: list[dict] = []
+    flags: list[dict] = []
+
+    # Normalize medication names for comparison
+    def normalize(name: str) -> str:
+        return name.strip().upper().replace("INJ ", "").replace("TAB ", "").replace("CAP ", "")
+
+    adm_names = {normalize(m.get("name", "")): m for m in admission}
+    inp_names = {normalize(m.get("name", "")): m for m in inpatient}
+    dis_names = {normalize(m.get("name", "")): m for m in discharge}
+
+    all_drugs = set(adm_names.keys()) | set(inp_names.keys()) | set(dis_names.keys())
+
+    for drug in sorted(all_drugs):
+        in_adm = drug in adm_names
+        in_inp = drug in inp_names
+        in_dis = drug in dis_names
+
+        entry = {
+            "drug": drug,
+            "in_admission": in_adm,
+            "in_inpatient": in_inp,
+            "in_discharge": in_dis,
+            "change_type": None,
+            "documented_reason": None,
+            "flag": None,
+        }
+
+        if in_inp and not in_dis:
+            entry["change_type"] = "STOPPED_AT_DISCHARGE"
+            med = inp_names[drug]
+            reason = med.get("change_reason")
+            entry["documented_reason"] = reason
+            if not reason:
+                entry["flag"] = "MEDICATION_STOPPED_NO_REASON"
+                flags.append({
+                    "field": f"medication_reconciliation.{drug}",
+                    "severity": "WARNING",
+                    "reason": f"{drug} was active during admission but absent from discharge medications. No documented reason for discontinuation.",
+                    "source_page": None,
+                    "requires_clinician": True,
+                })
+
+        elif in_inp and not in_adm:
+            entry["change_type"] = "ADDED_DURING_STAY"
+            med = inp_names[drug]
+            reason = med.get("change_reason")
+            entry["documented_reason"] = reason
+            if not reason:
+                entry["flag"] = "MEDICATION_ADDED_NO_REASON"
+                flags.append({
+                    "field": f"medication_reconciliation.{drug}",
+                    "severity": "WARNING",
+                    "reason": f"{drug} was added during hospital stay. No documented reason for initiation.",
+                    "source_page": None,
+                    "requires_clinician": True,
+                })
+
+        elif in_adm and in_dis:
+            # Check for dose changes
+            adm_dose = adm_names[drug].get("dose", "")
+            dis_dose = dis_names[drug].get("dose", "")
+            if adm_dose and dis_dose and adm_dose != dis_dose:
+                entry["change_type"] = "DOSE_CHANGED"
+                entry["flag"] = "DOSE_CHANGE"
+                flags.append({
+                    "field": f"medication_reconciliation.{drug}",
+                    "severity": "WARNING",
+                    "reason": f"{drug} dose changed from {adm_dose} to {dis_dose}. Verify reason.",
+                    "source_page": None,
+                    "requires_clinician": True,
+                })
+            else:
+                entry["change_type"] = "CONTINUED"
+
+        elif in_dis and not in_adm and not in_inp:
+            entry["change_type"] = "NEW_AT_DISCHARGE"
+            entry["flag"] = "NEW_MEDICATION_AT_DISCHARGE"
+            flags.append({
+                "field": f"medication_reconciliation.{drug}",
+                "severity": "WARNING",
+                "reason": f"{drug} appears in discharge medications but was not documented during admission or inpatient stay.",
+                "source_page": None,
+                "requires_clinician": True,
+            })
+
+        reconciliation.append(entry)
+
+    return {"reconciliation": reconciliation, "flags": flags}
+
+
+# ─── TOOL: DRUG INTERACTION LOOKUP (MOCKED) ─────────────────────────────────────
+
+def lookup_drug_interactions(medications: list[str]) -> dict:
+    """
+    Check for known drug-drug interactions. [MOCKED — not a real pharmacopeia call]
+
+    Purpose:
+        In production, this would call a real drug interaction database.
+        The mock returns plausible flagged pairs for common clinical combos.
+
+    Clinical Safety:
+        Clearly labeled as MOCKED in all outputs. Never presented as
+        authoritative pharmacological advice.
+
+    Returns:
+        {"interactions": [dict], "mocked": True}
+    """
+    interactions: list[dict] = []
+    med_upper = [m.upper() for m in medications]
+
+    # Known interaction patterns (simplified mock)
+    known_pairs = [
+        ({"MEROPENEM", "VALPROIC ACID"}, "Meropenem may reduce valproic acid levels", "CRITICAL"),
+        ({"METFORMIN", "CONTRAST"}, "Hold metformin before/after IV contrast", "WARNING"),
+        ({"INSULIN", "METFORMIN"}, "Monitor for hypoglycemia with dual therapy", "WARNING"),
+        ({"HEPARIN", "ASPIRIN"}, "Increased bleeding risk", "WARNING"),
+    ]
+
+    for pair, description, severity in known_pairs:
+        if pair.issubset(set(med_upper)):
+            interactions.append({
+                "drugs": list(pair),
+                "description": description,
+                "severity": severity,
+                "source": "[MOCKED — not a real pharmacopeia call]",
+            })
+
+    return {
+        "interactions": interactions,
+        "mocked": True,
+        "note": "[MOCKED — This is not a real pharmacopeia lookup. In production, integrate with a clinical drug interaction database.]"
+    }
+
+
+# ─── SAFE TOOL CALL WRAPPER ─────────────────────────────────────────────────────
+
+def safe_tool_call(
+    tool_fn: Callable,
+    inputs: dict,
+    state: dict,
+    tool_name: str,
+    target_field: str,
+    step_number: int,
+) -> tuple[Optional[Any], dict]:
+    """
+    Wrap every tool call with retry logic and failure handling.
+
+    Purpose:
+        Ensures no tool failure crashes the agent. Failed tools result in
+        [UNRESOLVED] markers, never fabricated data.
+
+    Clinical Safety:
+        - Max 2 retries (3 total attempts) before giving up.
+        - On final failure, marks the target field as [UNRESOLVED].
+        - Logs every attempt in the trace, including failures.
+        - NEVER guesses a value on tool failure.
+
+    Returns:
+        (result_or_None, updated_state)
+    """
+    max_retries = MAX_RETRIES
+
+    for attempt in range(max_retries + 1):
+        try:
+            result = tool_fn(**inputs)
+
+            # Validate result is not empty/None
+            if not result or (isinstance(result, dict) and all(v is None for v in result.values())):
+                raise ValueError("Tool returned empty result")
+
+            emit_trace(
+                state=state,
+                step_number=step_number,
+                phase="CALL_TOOL",
+                reasoning=f"Calling {tool_name} for {target_field}",
+                action="TOOL_CALL",
+                tool_name=tool_name,
+                tool_inputs=inputs,
+                tool_output_summary=f"Success on attempt {attempt + 1}",
+                observation=f"Tool {tool_name} returned valid data",
+                decision=f"Proceed with extracted data for {target_field}",
+                fields_updated=[target_field],
+            )
+            return result, state
+
+        except Exception as e:
+            state["retry_counts"][tool_name] = state.get("retry_counts", {}).get(tool_name, 0) + 1
+
+            emit_trace(
+                state=state,
+                step_number=step_number,
+                phase="CALL_TOOL",
+                reasoning=f"Tool {tool_name} failed on attempt {attempt + 1}",
+                action="RETRY" if attempt < max_retries else "GIVE_UP",
+                tool_name=tool_name,
+                tool_inputs=inputs,
+                tool_output_summary=f"FAILED: {str(e)[:200]}",
+                observation=f"Attempt {attempt + 1}/{max_retries + 1} failed",
+                decision="Retry" if attempt < max_retries else "Mark as UNRESOLVED",
+                fields_updated=[],
+                fallback_taken=True,
+                fallback_reason=f"Attempt {attempt + 1} failed: {str(e)[:200]}",
+            )
+
+            if attempt == max_retries:
+                # Mark field as unresolved — DO NOT guess
+                state["fabrication_blocks"].append(
+                    f"{target_field}: Tool {tool_name} failed after {max_retries + 1} attempts. "
+                    f"Marked [UNRESOLVED]."
+                )
+                return None, state
+
+    return None, state
