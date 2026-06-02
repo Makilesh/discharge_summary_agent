@@ -64,6 +64,7 @@ class AgentState(TypedDict):
     """
 
     # ─── DOCUMENT INVENTORY ──────────────────────────────────────────────────
+    _pdf_path: str
     loaded_documents: Annotated[list[dict], operator.add]
     # Each: {page_num: int, source_type: str, raw_text: str, confidence: float}
     unreadable_pages: Annotated[list[int], operator.add]
@@ -135,6 +136,7 @@ def create_initial_state() -> dict:
 
     return {
         # Document inventory
+        "_pdf_path": "",
         "loaded_documents": [],
         "unreadable_pages": [],
         "page_images": {},

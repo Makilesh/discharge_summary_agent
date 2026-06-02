@@ -54,6 +54,7 @@ def initialize_node(state: dict) -> dict:
 
     This node consumes 2 steps: one for image extraction, one for classification.
     """
+    start_trace_len = len(state.get("trace", []))
     pdf_path = state.get("_pdf_path", "")
     step = MAX_ITERATIONS - state.get("steps_remaining", MAX_ITERATIONS)
 
@@ -170,6 +171,7 @@ def initialize_node(state: dict) -> dict:
         "processing_queue": processing_queue,
         "steps_remaining": state.get("steps_remaining", MAX_ITERATIONS) - 2,
         "current_phase": "REASON",
+        "trace": state.get("trace", [])[start_trace_len:],
     }
 
 
@@ -187,6 +189,7 @@ def reason_node(state: dict) -> dict:
         Must follow the EXTRACTION_PRIORITY_ORDER strictly.
         Must not skip ahead — higher priority types inform lower ones.
     """
+    start_trace_len = len(state.get("trace", []))
     step = MAX_ITERATIONS - state.get("steps_remaining", MAX_ITERATIONS)
     queue = state.get("processing_queue", [])
 
@@ -217,6 +220,7 @@ def reason_node(state: dict) -> dict:
             "current_phase": "CALL_TOOL" if next_action == "RECONCILE_MEDICATIONS" else "VERIFY",
             "steps_remaining": state["steps_remaining"] - 1,
             "_next_action": next_action,
+            "trace": state.get("trace", [])[start_trace_len:],
         }
 
     # Get next batch from queue
@@ -249,6 +253,7 @@ def reason_node(state: dict) -> dict:
         "_next_action": "EXTRACT",
         "_target_doc_type": doc_type,
         "_target_pages": pages,
+        "trace": state.get("trace", [])[start_trace_len:],
     }
 
 
@@ -267,6 +272,7 @@ def call_tool_node(state: dict) -> dict:
         - Failed tools result in [UNRESOLVED] markers.
         - Batch processing for same-type pages to save steps.
     """
+    start_trace_len = len(state.get("trace", []))
     step = MAX_ITERATIONS - state.get("steps_remaining", MAX_ITERATIONS)
     next_action = state.get("_next_action", "EXTRACT")
     page_images = state.get("page_images", {})
@@ -277,12 +283,13 @@ def call_tool_node(state: dict) -> dict:
     }
 
     if next_action == "RECONCILE_MEDICATIONS":
-        return _do_medication_reconciliation(state, step, updates)
+        updates = _do_medication_reconciliation(state, step, updates)
     elif next_action == "EXTRACT":
-        return _do_extraction(state, step, updates)
+        updates = _do_extraction(state, step, updates)
     elif next_action == "DRUG_INTERACTION_CHECK":
-        return _do_drug_interaction_check(state, step, updates)
+        updates = _do_drug_interaction_check(state, step, updates)
 
+    updates["trace"] = state.get("trace", [])[start_trace_len:]
     return updates
 
 
@@ -322,16 +329,23 @@ def _do_extraction(state: dict, step: int, updates: dict) -> dict:
             updates.setdefault("unreadable_pages", []).append(page_num)
             continue
 
+        # If the page type is UNKNOWN, try to classify it on the fly from text
+        page_doc_type = doc_type
+        if page_doc_type == "UNKNOWN":
+            from .tools import classify_page_from_text
+            page_doc_type = classify_page_from_text(text)
+            print(f"  [RE-CLASSIFY] Page {page_num} text-classified as {page_doc_type}")
+
         # Step 2: Extract structured data based on doc type
         try:
             extracted = extract_clinical_data(
                 text=text, page_num=page_num,
-                doc_type=doc_type, image_b64=img_b64,
+                doc_type=page_doc_type, image_b64=img_b64,
             )
         except Exception as e:
             emit_trace(
                 state=state, step_number=step, phase="CALL_TOOL",
-                reasoning=f"Extraction failed for page {page_num} ({doc_type})",
+                reasoning=f"Extraction failed for page {page_num} ({page_doc_type})",
                 action="EXTRACTION_FAILED", fallback_taken=True,
                 fallback_reason=str(e)[:200],
             )
@@ -340,7 +354,7 @@ def _do_extraction(state: dict, step: int, updates: dict) -> dict:
         # Build document entry
         doc_entry = {
             "page_num": page_num,
-            "source_type": doc_type,
+            "source_type": page_doc_type,
             "raw_text": text[:5000],  # Truncate for state size
             "confidence": confidence,
             "extracted_data": extracted,
@@ -349,13 +363,13 @@ def _do_extraction(state: dict, step: int, updates: dict) -> dict:
 
         # Route extracted data to appropriate state fields
         _route_extracted_data(
-            state, extracted, doc_type, page_num, updates,
+            state, extracted, page_doc_type, page_num, updates,
             new_lab_results, new_imaging, new_procedures, new_meds,
         )
 
     emit_trace(
         state=state, step_number=step, phase="CALL_TOOL",
-        reasoning=f"Processed {len(target_pages)} pages of type {doc_type}",
+        reasoning=f"Processed {len(target_pages)} pages of type {doc_type} (on-the-fly resolved to: {page_doc_type if 'page_doc_type' in locals() else doc_type})",
         action="EXTRACTION_COMPLETE",
         tool_name=f"extract_{doc_type.lower()}",
         observation=f"Extracted data from {len(new_docs)} pages",
@@ -609,6 +623,7 @@ def observe_node(state: dict) -> dict:
     Clinical Safety:
         Observation must never modify data — only log what was received.
     """
+    start_trace_len = len(state.get("trace", []))
     step = MAX_ITERATIONS - state.get("steps_remaining", MAX_ITERATIONS)
 
     emit_trace(
@@ -621,6 +636,7 @@ def observe_node(state: dict) -> dict:
 
     return {
         "current_phase": "VERIFY",
+        "trace": state.get("trace", [])[start_trace_len:],
     }
 
 
@@ -639,6 +655,7 @@ def verify_node(state: dict) -> dict:
         identify when enough data has been gathered vs when critical
         fields are still missing.
     """
+    start_trace_len = len(state.get("trace", []))
     step = MAX_ITERATIONS - state.get("steps_remaining", MAX_ITERATIONS)
     completed, missing, flagged = validate_state_completeness(state)
 
@@ -662,6 +679,7 @@ def verify_node(state: dict) -> dict:
     return {
         "current_phase": "VERIFY_DONE",
         "steps_remaining": state["steps_remaining"] - 1,
+        "trace": state.get("trace", [])[start_trace_len:],
     }
 
 
@@ -680,6 +698,9 @@ def compile_node(state: dict) -> dict:
         The cross_reference_audit MUST run before compilation.
         The agent MUST NOT skip this step even under step pressure.
     """
+    start_trace_len = len(state.get("trace", []))
+    start_flags_len = len(state.get("escalation_flags", []))
+    start_conflicts_len = len(state.get("conflicts", []))
     step = MAX_ITERATIONS - state.get("steps_remaining", MAX_ITERATIONS)
 
     emit_trace(
@@ -719,9 +740,11 @@ def compile_node(state: dict) -> dict:
 
     return {
         "final_summary": summary,
-        "conflicts": new_conflicts,
+        "conflicts": compile_state.get("conflicts", [])[start_conflicts_len:],
+        "escalation_flags": compile_state.get("escalation_flags", [])[start_flags_len:],
         "hospital_course": hospital_course,
         "current_phase": "DONE",
+        "trace": state.get("trace", [])[start_trace_len:],
     }
 
 
@@ -740,6 +763,10 @@ def hard_cap_escalate_node(state: dict) -> dict:
         cannot appear complete when it is not. The HARD_CAP_HIT
         flag is prominently displayed.
     """
+    start_trace_len = len(state.get("trace", []))
+    start_flags_len = len(state.get("escalation_flags", []))
+    start_conflicts_len = len(state.get("conflicts", []))
+
     emit_trace(
         state=state, step_number=MAX_ITERATIONS, phase="HARD_CAP_ESCALATE",
         reasoning="Agent step cap reached. Compiling with available data.",
@@ -776,16 +803,11 @@ def hard_cap_escalate_node(state: dict) -> dict:
 
     return {
         "final_summary": summary,
-        "conflicts": new_conflicts,
+        "conflicts": compile_state.get("conflicts", [])[start_conflicts_len:],
+        "escalation_flags": compile_state.get("escalation_flags", [])[start_flags_len:],
         "hospital_course": hospital_course,
         "current_phase": "DONE",
-        "escalation_flags": [{
-            "field": "SUMMARY_COMPLETENESS",
-            "severity": "CRITICAL",
-            "reason": "Agent step cap (20) reached. Some document types may not have been processed.",
-            "source_page": None,
-            "requires_clinician": True,
-        }],
+        "trace": state.get("trace", [])[start_trace_len:],
     }
 
 

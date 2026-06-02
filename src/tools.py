@@ -15,9 +15,11 @@ Clinical Safety:
 from __future__ import annotations
 import json
 import re
+import os
 from typing import Optional, Callable, Any
 
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 
 from .config import (
@@ -45,23 +47,92 @@ def get_llm() -> ChatGoogleGenerativeAI:
     return _llm
 
 
+def classify_page_from_text(text: str) -> str:
+    """
+    Classify page type from its OCR text using Ollama deepseek-r1:14b.
+    
+    Clinical Safety:
+        Returns UNKNOWN if classification fails or is not in taxonomy.
+    """
+    doc_types_str = "\n".join(f"- {dt}" for dt in DOC_TYPES)
+    prompt = f"""You are a clinical document classifier. Classify the following page text into one of these taxonomy types:
+{doc_types_str}
+
+Page text snippet:
+{text[:2000]}
+
+Rules:
+- Select exactly one document type from the taxonomy above.
+- Return ONLY the classification type name (e.g. "DRUG_CHART" or "LAB_REPORT_BIOCHEMISTRY"), with no other explanation or markdown formatting.
+- If it doesn't fit any type, return "UNKNOWN"."""
+    
+    try:
+        ollama_llm = ChatOpenAI(
+            model="deepseek-r1:14b",
+            openai_api_key="ollama",
+            base_url="http://localhost:11434/v1",
+            temperature=0.0,
+        )
+        msg = HumanMessage(content=prompt)
+        response = ollama_llm.invoke([msg])
+        content = response.content
+        content = re.sub(r'<think>[\s\S]*?</think>', '', content)
+        content = re.sub(r'<thought>[\s\S]*?</thought>', '', content)
+        cleaned_type = content.strip().upper()
+        # Find matches in DOC_TYPES
+        for dt in DOC_TYPES:
+            if dt in cleaned_type:
+                return dt
+        return "UNKNOWN"
+    except Exception as e:
+        print(f"[CLASSIFY] Warning: Failed to classify page from text: {e}")
+        return "UNKNOWN"
+
+
 def _call_vision_llm(prompt: str, image_b64_list: list[str]) -> str:
     """
     Call Gemini Vision with text prompt and one or more page images.
     
     Returns the raw text response from the LLM.
-    Raises exception on API failure (handled by safe_tool_call).
+    Falls back to Ollama deepseek-r1:14b on failure or dummy key.
     """
-    llm = get_llm()
-    content: list[dict] = [{"type": "text", "text": prompt}]
-    for img_b64 in image_b64_list:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-        })
-    msg = HumanMessage(content=content)
-    response = llm.invoke([msg])
-    return response.content
+    is_dummy_key = not GOOGLE_API_KEY or "your-google-api-key" in GOOGLE_API_KEY
+    
+    if not is_dummy_key:
+        try:
+            llm = get_llm()
+            content: list[dict] = [{"type": "text", "text": prompt}]
+            for img_b64 in image_b64_list:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                })
+            msg = HumanMessage(content=content)
+            response = llm.invoke([msg])
+            return response.content
+        except Exception as e:
+            print(f"\n[BACKUP] Gemini call failed: {e}. Falling back to Ollama deepseek-r1:14b...")
+    else:
+        print("\n[BACKUP] Gemini API key is missing or dummy. Falling back to Ollama deepseek-r1:14b...")
+
+    try:
+        ollama_llm = ChatOpenAI(
+            model="deepseek-r1:14b",
+            openai_api_key="ollama",
+            base_url="http://localhost:11434/v1",
+            temperature=0.0,
+        )
+        msg = HumanMessage(content=prompt)
+        response = ollama_llm.invoke([msg])
+        
+        # Strip <think>...</think> or <thought>...</thought> tags if present
+        content = response.content
+        content = re.sub(r'<think>[\s\S]*?</think>', '', content)
+        content = re.sub(r'<thought>[\s\S]*?</thought>', '', content)
+        return content.strip()
+    except Exception as e:
+        print(f"[BACKUP] Ollama call failed: {e}")
+        raise e
 
 
 def _parse_json_response(response_text: str) -> dict | list:
@@ -138,12 +209,55 @@ Rules:
 Return ONLY the JSON array, no other text."""
 
     images = [img for _, img in page_images_b64]
-    response = _call_vision_llm(prompt, images)
-    parsed = _parse_json_response(response)
+    
+    is_dummy_key = not GOOGLE_API_KEY or "your-google-api-key" in GOOGLE_API_KEY
+    
+    if not is_dummy_key:
+        try:
+            response = _call_vision_llm(prompt, images)
+            parsed = _parse_json_response(response)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                return parsed
+        except Exception as e:
+            print(f"[CLASSIFY] Gemini Vision classification failed: {e}. Falling back to text-based classification...")
 
-    if isinstance(parsed, list):
-        return parsed
-    return []
+    # Fallback: classify based on page texts using Ollama deepseek-r1:14b
+    print("[CLASSIFY] Running text-based classification via Ollama deepseek-r1:14b...")
+    classifications = []
+    for page_num, img_b64 in page_images_b64:
+        cache_file = f"patient2_page_{page_num}.txt"
+        page_text = ""
+        if os.path.exists(cache_file):
+            with open(cache_file, "r", encoding="utf-8") as f:
+                page_text = f.read().strip()
+                
+        header_pattern = f"=== PAGE {page_num} ==="
+        clean_text = page_text.replace(header_pattern, "").strip()
+        
+        # If cache is missing or empty, try extracting via OCR
+        if len(clean_text) < MIN_TEXT_LENGTH:
+            try:
+                ocr_result = extract_page_text(img_b64, page_num)
+                page_text = ocr_result.get("text", "")
+            except Exception:
+                page_text = ""
+                
+        clean_text = page_text.replace(header_pattern, "").strip()
+        if len(clean_text) >= MIN_TEXT_LENGTH:
+            doc_type = classify_page_from_text(clean_text)
+            classifications.append({
+                "page_num": page_num,
+                "doc_type": doc_type,
+                "confidence": 0.8,
+            })
+        else:
+            classifications.append({
+                "page_num": page_num,
+                "doc_type": "UNKNOWN",
+                "confidence": 0.0,
+            })
+            
+    return classifications
 
 
 # ─── TOOL: EXTRACT PAGE TEXT (OCR) ──────────────────────────────────────────────
@@ -155,6 +269,7 @@ def extract_page_text(image_b64: str, page_num: int) -> dict:
     Purpose:
         Full OCR extraction of a page, including handwritten text.
         Returns both the extracted text and a confidence estimate.
+        Loads from and saves to local text cache when possible.
 
     Clinical Safety:
         - Always attempts full extraction even when confidence is low.
@@ -166,6 +281,24 @@ def extract_page_text(image_b64: str, page_num: int) -> dict:
         {"text": str, "confidence": float, "page_num": int}
         On failure: {"text": "", "confidence": 0.0, "page_num": page_num}
     """
+    # 1. Check if local text cache exists and is populated
+    cache_file = f"patient2_page_{page_num}.txt"
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            header_pattern = f"=== PAGE {page_num} ==="
+            clean_text = text.replace(header_pattern, "").strip()
+            if len(clean_text) >= MIN_TEXT_LENGTH:
+                print(f"  ✓ Loaded Page {page_num} OCR text from local cache {cache_file} ({len(clean_text)} chars)")
+                return {
+                    "text": text,
+                    "confidence": 1.0,
+                    "page_num": page_num,
+                }
+        except Exception as cache_err:
+            print(f"[CACHE] Warning: Failed to read OCR cache for Page {page_num}: {cache_err}")
+
     prompt = f"""You are a clinical document OCR system. Extract ALL text from this scanned hospital page (Page {page_num}).
 
 Rules:
@@ -196,6 +329,14 @@ Where 1.0 = fully legible typed text, 0.5 = partially legible, 0.0 = completely 
 
     # Remove confidence line from text
     text = re.sub(r'\nEXTRACTION_CONFIDENCE:.*$', '', response, flags=re.MULTILINE).strip()
+
+    # 2. Write response to local text cache file
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            f.write(f"=== PAGE {page_num} ===\n\n{text}")
+        print(f"  ✓ Saved Page {page_num} OCR text to local cache {cache_file}")
+    except Exception as cache_err:
+        print(f"[CACHE] Warning: Failed to save OCR cache for Page {page_num}: {cache_err}")
 
     return {
         "text": text,

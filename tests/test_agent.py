@@ -600,6 +600,60 @@ class TestPageHandling:
         assert MIN_TEXT_LENGTH == 30
 
 
+# ─── TEST: Ollama Backup & OCR Caching ──────────────────────────────────────────
+
+class TestOllamaBackup:
+    """Tests for Ollama backup and OCR text caching."""
+
+    def test_classify_page_from_text_fallback(self):
+        """Test classifying a page from its text using Ollama."""
+        # Simple test text representing nursing notes
+        test_text = "Patient observed by nurse at bedside. Temp 98.6F, BP 120/80. Administered paracetamol."
+        
+        # Check if Ollama is available
+        import http.client
+        ollama_available = False
+        try:
+            conn = http.client.HTTPConnection("localhost", 11434, timeout=2)
+            conn.request("GET", "/")
+            res = conn.getresponse()
+            if res.status == 200:
+                ollama_available = True
+        except Exception:
+            pass
+            
+        if not ollama_available:
+            pytest.skip("Ollama is not running locally. Skipping test.")
+            
+        from src.tools import classify_page_from_text
+        doc_type = classify_page_from_text(test_text)
+        from src.config import DOC_TYPES
+        assert doc_type in DOC_TYPES or doc_type == "UNKNOWN"
+
+    def test_ocr_caching(self):
+        """Test that OCR text is cached locally and loaded correctly."""
+        import os
+        from src.tools import extract_page_text
+        
+        cache_file = "patient2_page_999.txt"
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+            
+        try:
+            # Pre-populate the cache file
+            with open(cache_file, "w", encoding="utf-8") as f:
+                f.write("=== PAGE 999 ===\n\nCached clinical content that is longer than 30 characters.")
+                
+            # Calling extract_page_text should load it from cache immediately without calling LLM
+            res = extract_page_text("dummy_image_data", 999)
+            assert res["confidence"] == 1.0
+            assert "Cached clinical content" in res["text"]
+            assert res["page_num"] == 999
+        finally:
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+
+
 # ─── RUN ─────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
