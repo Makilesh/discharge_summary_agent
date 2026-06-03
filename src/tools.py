@@ -77,6 +77,19 @@ def get_ocr_cache_file(page_num: int) -> Path:
     return Path(f"patient2_page_{page_num}.txt")
 
 
+def get_extraction_cache_file(page_num: int, doc_type: str) -> Path:
+    """
+    Return the path for storing extracted structured JSON data.
+    """
+    namespace = os.getenv("OCR_CACHE_NAMESPACE", "").strip()
+    if namespace:
+        cache_dir = Path(os.getenv("OCR_CACHE_DIR", "output/ocr_cache"))
+        # Clean doc_type to make it safe for file names
+        safe_doc_type = "".join(c if c.isalnum() else "_" for c in doc_type).strip("_")
+        return cache_dir / namespace / f"extracted_{page_num}_{safe_doc_type}.json"
+    return Path(f"extracted_{page_num}_{doc_type}.json")
+
+
 def get_llm() -> ChatGoogleGenerativeAI:
     """Get or create the Gemini Vision LLM instance."""
     global _llm, _llm_model_name
@@ -200,14 +213,14 @@ def _read_cached_ocr_text(page_num: int) -> str:
     return text.replace(f"=== PAGE {page_num} ===", "").strip()
 
 
-def _call_vision_llm(prompt: str, image_b64_list: list[str]) -> str:
+def _call_vision_llm(prompt: str, image_b64_list: list[str], force_local: bool = False) -> str:
     """
     Call Gemini Vision with text prompt and one or more page images.
     
     Returns the raw text response from the configured LLM backend.
     Uses Gemini, Ollama text reasoning, or Ollama vision depending on backend and inputs.
     """
-    backend = get_backend()
+    backend = "local" if force_local else get_backend()
     google_api_key = _env("GOOGLE_API_KEY", GOOGLE_API_KEY)
     is_dummy_key = not google_api_key or "your-google-api-key" in google_api_key
     
@@ -548,11 +561,21 @@ def extract_typed_summary(text: str, page_num: int) -> dict:
         {"demographics": dict, "diagnoses": dict, "medications": list,
          "follow_up": list, "condition_at_discharge": str}
     """
+    cache_file = get_extraction_cache_file(page_num, "TYPED_DISCHARGE_SUMMARY")
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            print(f"  [CACHE] Loaded Page {page_num} (TYPED_DISCHARGE_SUMMARY) extraction from cache")
+            return data
+        except Exception as e:
+            print(f"[CACHE] Warning: Failed to read extraction cache for Page {page_num}: {e}")
+
     prompt = f"""You are a clinical data extractor. Parse this typed discharge summary (Page {page_num}).
 
 Extract the following into a JSON object:
-{{
-    "demographics": {{
+{
+    "demographics": {
         "name": "<patient name or null>",
         "age": "<age or null>",
         "gender": "<gender or null>",
@@ -561,29 +584,29 @@ Extract the following into a JSON object:
         "blood_group": "<blood group or null>",
         "weight": "<weight or null>",
         "address": "<address or null>"
-    }},
+    },
     "admission_date": "<dd/mm/yyyy or null>",
     "discharge_date": "<dd/mm/yyyy or null>",
-    "diagnoses": {{
+    "diagnoses": {
         "principal": ["<exact text>"],
         "secondary": ["<exact text>"],
         "provisional": ["<exact text>"],
         "final": ["<exact text>"]
-    }},
+    },
     "chief_complaints": ["<exact text>"],
     "past_history": "<exact text or null>",
     "medications": [
-        {{
+        {
             "name": "<drug name>",
             "dose": "<dose or null>",
             "route": "<route or null>",
             "frequency": "<frequency or null>"
-        }}
+        }
     ],
     "follow_up": ["<instruction>"],
     "condition_at_discharge": "<exact text or null>",
     "allergies": ["<allergy or 'NOT KNOWN'>"]
-}}
+}
 
 Rules:
 - Extract EXACTLY what is written. Do not paraphrase or infer.
@@ -598,7 +621,15 @@ SOURCE TEXT:
 Return ONLY the JSON object."""
 
     response = _call_vision_llm(prompt, [])
-    return _parse_json_response(response)
+    result = _parse_json_response(response)
+    if result:
+        try:
+            os.makedirs(cache_file.parent, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+        except Exception as e:
+            print(f"[CACHE] Warning: Failed to write extraction cache for Page {page_num}: {e}")
+    return result
 
 
 # ─── TOOL: EXTRACT CLINICAL DATA FROM ANY PAGE ─────────────────────────────────
@@ -626,6 +657,16 @@ def extract_clinical_data(
     Returns:
         Dict with extracted fields relevant to the document type.
     """
+    cache_file = get_extraction_cache_file(page_num, doc_type)
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            print(f"  [CACHE] Loaded Page {page_num} ({doc_type}) extraction from cache")
+            return data
+        except Exception as e:
+            print(f"[CACHE] Warning: Failed to read extraction cache for Page {page_num}: {e}")
+
     type_specific_instructions = _get_extraction_instructions(doc_type)
 
     prompt = f"""You are a clinical data extractor. Extract structured data from this {doc_type} page (Page {page_num}).
@@ -639,12 +680,27 @@ Return a JSON object with the extracted data. Use null for fields not found.
 Do NOT invent or infer any clinical facts not explicitly present in the text.
 If text is partially legible, use [UNCLEAR: best_guess] annotations."""
 
+    local_only_types = {
+        "NURSING_NOTES", "NURSING_ASSESSMENT", "INTAKE_OUTPUT_CHART",
+        "PROCEDURE_CHART", "BED_SORES_CHART", "CAUTI_CHART",
+        "INVESTIGATION_CHECKLIST", "DISCHARGE_CHECKLIST"
+    }
+    force_local = doc_type in local_only_types
     images = [image_b64] if image_b64 else []
-    response = _call_vision_llm(prompt, images)
+    response = _call_vision_llm(prompt, images, force_local=force_local)
     result = _parse_json_response(response)
     if isinstance(result, dict):
         result["source_page"] = page_num
         result["source_type"] = doc_type
+
+    if result:
+        try:
+            os.makedirs(cache_file.parent, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+        except Exception as e:
+            print(f"[CACHE] Warning: Failed to write extraction cache for Page {page_num}: {e}")
+
     return result
 
 
@@ -798,6 +854,16 @@ def extract_lab_report(text: str, page_num: int, report_type: str) -> dict:
     Returns:
         {"results": [{"test", "value", "unit", "ref_range", "date", "abnormal_flag"}]}
     """
+    cache_file = get_extraction_cache_file(page_num, report_type)
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            print(f"  [CACHE] Loaded Page {page_num} ({report_type}) extraction from cache")
+            return data
+        except Exception as e:
+            print(f"[CACHE] Warning: Failed to read extraction cache for Page {page_num}: {e}")
+
     prompt = f"""You are a clinical lab result parser. Extract ALL lab results from this {report_type} report (Page {page_num}).
 
 Return a JSON object:
@@ -830,7 +896,15 @@ SOURCE TEXT:
 Return ONLY the JSON object."""
 
     response = _call_vision_llm(prompt, [])
-    return _parse_json_response(response)
+    result = _parse_json_response(response)
+    if result:
+        try:
+            os.makedirs(cache_file.parent, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+        except Exception as e:
+            print(f"[CACHE] Warning: Failed to write extraction cache for Page {page_num}: {e}")
+    return result
 
 
 # ─── TOOL: EXTRACT DRUG CHART (BATCH) ──────────────────────────────────────────
@@ -839,22 +913,17 @@ def extract_drug_chart_batch(
     page_texts: list[tuple[int, str]],
     page_images: Optional[list[tuple[int, str]]] = None,
 ) -> dict:
-    """
-    Parse multiple drug chart pages in a single batch call.
+    page_nums_str = "_".join(str(p[0]) for p in page_texts)
+    cache_file = get_extraction_cache_file(0, f"DRUG_CHART_BATCH_{page_nums_str}")
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            print(f"  [CACHE] Loaded Drug Chart batch extraction from cache")
+            return data
+        except Exception as e:
+            print(f"[CACHE] Warning: Failed to read batch extraction cache: {e}")
 
-    Purpose:
-        Drug charts typically span 2-3 pages. Batch processing saves agent
-        steps and allows cross-page medication timeline reconstruction.
-
-    Clinical Safety:
-        - Must extract EVERY medication entry. No silent drops.
-        - Must map column headers (D1, D2, D3...) to calendar dates.
-        - Must detect medications present in inpatient charts but absent
-          from discharge — potential CR-1 violation.
-
-    Returns:
-        {"medications": [MedicationEntry-like dicts]}
-    """
     combined_text = "\n\n".join(
         f"--- PAGE {pn} ---\n{text}" for pn, text in page_texts
     )
@@ -896,7 +965,15 @@ Return ONLY the JSON object."""
 
     images = [img for _, img in (page_images or [])]
     response = _call_vision_llm(prompt, images)
-    return _parse_json_response(response)
+    result = _parse_json_response(response)
+    if result:
+        try:
+            os.makedirs(cache_file.parent, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+        except Exception as e:
+            print(f"[CACHE] Warning: Failed to write batch extraction cache: {e}")
+    return result
 
 
 # ─── TOOL: RECONCILE MEDICATIONS ────────────────────────────────────────────────
