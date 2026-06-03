@@ -25,7 +25,7 @@ from .config import (
 from .trace import validate_state_completeness, generate_trace_summary
 
 
-def compile_discharge_summary(state: dict) -> str:
+def compile_discharge_summary(state: dict, correction_context: str = "") -> str:
     """
     Assemble the final structured summary from the agent state.
 
@@ -33,11 +33,19 @@ def compile_discharge_summary(state: dict) -> str:
         Produces a Markdown-formatted discharge summary draft containing
         all 17 required sections with source citations.
 
+    Args:
+        state: The agent's accumulated state dictionary.
+        correction_context: Optional correction guidance from Part 2's learning loop.
+            When non-empty, this string is prepended to the summary as a correction
+            guidance block visible in the output for audit purposes.
+
     Clinical Safety Constraint:
         - Every clinical claim MUST have a [Page N] citation.
         - Missing fields MUST use template strings.
         - Escalation and conflict sections are NEVER omitted.
         - Status is ALWAYS "DRAFT — NOT FOR CLINICAL USE WITHOUT REVIEW".
+        - correction_context does NOT modify clinical data — it only provides
+          prompt guidance for future compilations.
 
     Failure Behavior:
         If compilation encounters an error in any section, that section
@@ -52,6 +60,12 @@ def compile_discharge_summary(state: dict) -> str:
     sections.append("")
     sections.append("> ⚠️ **THIS IS AN AI-GENERATED DRAFT. NOT FOR CLINICAL USE WITHOUT CLINICIAN REVIEW AND SIGN-OFF.**")
     sections.append("")
+
+    # ─── CORRECTION CONTEXT (Part 2 Learning Loop) ───────────────────────────
+    if correction_context:
+        sections.append("<!-- CORRECTION GUIDANCE (Part 2 Learning Loop) -->")
+        sections.append(f"<!-- {correction_context[:2000]} -->")
+        sections.append("")
 
     # ─── 1. PATIENT DEMOGRAPHICS ─────────────────────────────────────────────
     sections.append("## 1. Patient Demographics")
