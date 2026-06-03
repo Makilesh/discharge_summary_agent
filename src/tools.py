@@ -25,6 +25,7 @@ from langchain_core.messages import HumanMessage
 
 from .config import (
     GOOGLE_API_KEY, LLM_MODEL, LLM_TEMPERATURE,
+    LLM_BACKEND, OLLAMA_BASE_URL, REASONING_BACKUP_MODEL, VISION_BACKUP_MODEL,
     DOC_TYPES, MAX_RETRIES, MIN_TEXT_LENGTH,
 )
 from .trace import emit_trace
@@ -33,6 +34,32 @@ from .trace import emit_trace
 # ─── LLM SINGLETON ──────────────────────────────────────────────────────────────
 
 _llm: Optional[ChatGoogleGenerativeAI] = None
+_llm_model_name: Optional[str] = None
+
+
+def _env(name: str, default: str) -> str:
+    return os.getenv(name, default).strip()
+
+
+def get_backend() -> str:
+    backend = _env("LLM_BACKEND", LLM_BACKEND).lower()
+    return backend if backend in {"auto", "gemini", "local"} else "auto"
+
+
+def get_gemini_model_name() -> str:
+    return _env("LLM_MODEL", LLM_MODEL)
+
+
+def get_reasoning_model_name() -> str:
+    return _env("REASONING_BACKUP_MODEL", REASONING_BACKUP_MODEL)
+
+
+def get_vision_model_name() -> str:
+    return _env("VISION_BACKUP_MODEL", VISION_BACKUP_MODEL)
+
+
+def get_ollama_base_url() -> str:
+    return _env("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
 
 
 def get_ocr_cache_file(page_num: int) -> Path:
@@ -52,15 +79,51 @@ def get_ocr_cache_file(page_num: int) -> Path:
 
 def get_llm() -> ChatGoogleGenerativeAI:
     """Get or create the Gemini Vision LLM instance."""
-    global _llm
-    if _llm is None:
+    global _llm, _llm_model_name
+    model_name = get_gemini_model_name()
+    if _llm is None or _llm_model_name != model_name:
         _llm = ChatGoogleGenerativeAI(
-            model=LLM_MODEL,
-            google_api_key=GOOGLE_API_KEY,
+            model=model_name,
+            google_api_key=_env("GOOGLE_API_KEY", GOOGLE_API_KEY),
             temperature=LLM_TEMPERATURE,
             max_output_tokens=8192,
         )
+        _llm_model_name = model_name
     return _llm
+
+
+def _call_ollama_text(prompt: str, model: Optional[str] = None) -> str:
+    ollama_llm = ChatOpenAI(
+        model=model or get_reasoning_model_name(),
+        openai_api_key="ollama",
+        base_url=get_ollama_base_url(),
+        temperature=0.0,
+    )
+    response = ollama_llm.invoke([HumanMessage(content=prompt)])
+    content = response.content
+    content = re.sub(r'<think>[\s\S]*?</think>', '', content)
+    content = re.sub(r'<thought>[\s\S]*?</thought>', '', content)
+    return content.strip()
+
+
+def _call_ollama_vision(prompt: str, image_b64_list: list[str]) -> str:
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for img_b64 in image_b64_list:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+        })
+    ollama_llm = ChatOpenAI(
+        model=get_vision_model_name(),
+        openai_api_key="ollama",
+        base_url=get_ollama_base_url(),
+        temperature=0.0,
+    )
+    response = ollama_llm.invoke([HumanMessage(content=content)])
+    content_text = response.content
+    content_text = re.sub(r'<think>[\s\S]*?</think>', '', content_text)
+    content_text = re.sub(r'<thought>[\s\S]*?</thought>', '', content_text)
+    return content_text.strip()
 
 
 def classify_page_from_text(text: str) -> str:
@@ -83,17 +146,7 @@ Rules:
 - If it doesn't fit any type, return "UNKNOWN"."""
     
     try:
-        ollama_llm = ChatOpenAI(
-            model="deepseek-r1:14b",
-            openai_api_key="ollama",
-            base_url="http://localhost:11434/v1",
-            temperature=0.0,
-        )
-        msg = HumanMessage(content=prompt)
-        response = ollama_llm.invoke([msg])
-        content = response.content
-        content = re.sub(r'<think>[\s\S]*?</think>', '', content)
-        content = re.sub(r'<thought>[\s\S]*?</thought>', '', content)
+        content = _call_ollama_text(prompt)
         cleaned_type = content.strip().upper()
         # Find matches in DOC_TYPES
         for dt in DOC_TYPES:
@@ -109,12 +162,14 @@ def _call_vision_llm(prompt: str, image_b64_list: list[str]) -> str:
     """
     Call Gemini Vision with text prompt and one or more page images.
     
-    Returns the raw text response from the LLM.
-    Falls back to Ollama deepseek-r1:14b on failure or dummy key.
+    Returns the raw text response from the configured LLM backend.
+    Uses Gemini, Ollama text reasoning, or Ollama vision depending on backend and inputs.
     """
-    is_dummy_key = not GOOGLE_API_KEY or "your-google-api-key" in GOOGLE_API_KEY
+    backend = get_backend()
+    google_api_key = _env("GOOGLE_API_KEY", GOOGLE_API_KEY)
+    is_dummy_key = not google_api_key or "your-google-api-key" in google_api_key
     
-    if not is_dummy_key:
+    if backend in {"auto", "gemini"} and not is_dummy_key:
         try:
             llm = get_llm()
             content: list[dict] = [{"type": "text", "text": prompt}]
@@ -128,32 +183,19 @@ def _call_vision_llm(prompt: str, image_b64_list: list[str]) -> str:
             return response.content
         except Exception as e:
             print(f"\n[BACKUP] Gemini call failed: {e}. Checking local fallback...")
-    else:
+            if backend == "gemini":
+                raise
+    elif backend == "gemini":
+        raise RuntimeError("LLM_BACKEND=gemini but GOOGLE_API_KEY is missing or dummy.")
+    elif backend == "auto":
         print("\n[BACKUP] Gemini API key is missing or dummy. Checking local fallback...")
 
-    if image_b64_list:
-        print("[BACKUP] Ollama fallback skipped: configured local model is text-only, not vision-capable.")
-        raise RuntimeError(
-            "Gemini Vision call failed or is unavailable, and the configured "
-            "Ollama fallback is text-only. Refusing to perform image OCR or "
-            "classification with a non-vision model."
-        )
-
     try:
-        ollama_llm = ChatOpenAI(
-            model="deepseek-r1:14b",
-            openai_api_key="ollama",
-            base_url="http://localhost:11434/v1",
-            temperature=0.0,
-        )
-        msg = HumanMessage(content=prompt)
-        response = ollama_llm.invoke([msg])
-        
-        # Strip <think>...</think> or <thought>...</thought> tags if present
-        content = response.content
-        content = re.sub(r'<think>[\s\S]*?</think>', '', content)
-        content = re.sub(r'<thought>[\s\S]*?</thought>', '', content)
-        return content.strip()
+        if image_b64_list:
+            print(f"[BACKUP] Using local vision model {get_vision_model_name()} via Ollama.")
+            return _call_ollama_vision(prompt, image_b64_list)
+        print(f"[BACKUP] Using local reasoning model {get_reasoning_model_name()} via Ollama.")
+        return _call_ollama_text(prompt)
     except Exception as e:
         print(f"[BACKUP] Ollama call failed: {e}")
         raise e
