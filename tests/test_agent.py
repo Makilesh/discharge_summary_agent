@@ -321,6 +321,29 @@ class TestCR2:
         # Consistent diagnoses should have no or minimal conflicts
         assert len(diag_conflicts) == 0, "Should NOT flag when diagnoses are consistent"
 
+    def test_chief_complaint_none_does_not_crash(self, empty_state: dict):
+        """Malformed extracted chief complaint entries must not abort CR-2."""
+        state = empty_state
+        state["loaded_documents"] = [
+            {
+                "page_num": 1,
+                "source_type": "ER_OBSERVATION_CHART",
+                "raw_text": "",
+                "confidence": 0.8,
+                "extracted_data": {"chief_complaints": [None]},
+            },
+            {
+                "page_num": 2,
+                "source_type": "ADMISSION_RECORD",
+                "raw_text": "",
+                "confidence": 0.8,
+                "extracted_data": {"chief_complaints": ["Fever"]},
+            },
+        ]
+
+        conflicts = check_cr2_diagnosis_conflicts(state)
+        assert isinstance(conflicts, list)
+
 
 # ─── TEST: CR-3 — Lab Evidence vs Clinical Claim ────────────────────────────────
 
@@ -674,6 +697,39 @@ class TestGraphExtraction:
         assert queue[0] == {"doc_type": "DRUG_CHART", "pages": [2]}
         assert queue[-1] == {"doc_type": "UNKNOWN", "pages": [1]}
 
+    def test_classifications_are_deduped_and_sanitized(self):
+        """Repeated pages and invalid doc labels should not waste extraction budget."""
+        from src.graph import _dedupe_and_sanitize_classifications
+
+        cleaned = _dedupe_and_sanitize_classifications([
+            {"page_num": 5, "doc_type": "NURSES_NOTES", "confidence": 0.5},
+            {"page_num": 5, "doc_type": "DRUG_CHART", "confidence": 0.9},
+            {"page_num": 6, "doc_type": "NOT_A_TYPE", "confidence": 0.7},
+        ])
+
+        assert cleaned == [
+            {"page_num": 5, "doc_type": "DRUG_CHART", "confidence": 0.9},
+            {"page_num": 6, "doc_type": "UNKNOWN", "confidence": 0.7},
+        ]
+
+    def test_classification_cache_roundtrip(self, monkeypatch, tmp_path):
+        """Cached classifications should reload when page coverage matches."""
+        import src.graph as graph
+
+        monkeypatch.setenv("OCR_CACHE_DIR", str(tmp_path))
+        classifications = [
+            {"page_num": 1, "doc_type": "NURSES_NOTES", "confidence": 0.8},
+            {"page_num": 2, "doc_type": "DRUG_CHART", "confidence": 0.9},
+        ]
+
+        graph._save_classification_cache("pdf_hash", classifications)
+        cached = graph._load_classification_cache("pdf_hash", [1, 2])
+
+        assert cached == [
+            {"page_num": 1, "doc_type": "NURSING_NOTES", "confidence": 0.8},
+            {"page_num": 2, "doc_type": "DRUG_CHART", "confidence": 0.9},
+        ]
+
     def test_unknown_pages_respect_batch_size(self):
         """Fallback UNKNOWN extraction batches must remain bounded."""
         from src.config import BATCH_SIZE
@@ -762,6 +818,34 @@ class TestGraphExtraction:
         assert len(calls) == 1
         assert [page for page, _ in calls[0][0]] == [42, 43, 44]
         assert updates["inpatient_medications"][0]["name"] == "INJ MEROPENEM"
+
+    def test_typed_summary_medications_route_to_discharge(self, empty_state: dict):
+        """Medication advice on typed discharge summary belongs in discharge meds."""
+        import src.graph as graph
+
+        extracted = {
+            "medications": [
+                {"name": "TAB RACIPER", "dose": "40mg", "route": "PO", "frequency": "OD"}
+            ]
+        }
+        updates = {}
+        new_meds = []
+
+        graph._route_extracted_data(
+            empty_state,
+            extracted,
+            "TYPED_DISCHARGE_SUMMARY",
+            2,
+            updates,
+            [],
+            [],
+            [],
+            new_meds,
+        )
+
+        assert new_meds[0]["name"] == "TAB RACIPER"
+        assert new_meds[0]["status"] == "DISCHARGE"
+        assert new_meds[0]["source_pages"] == [2]
 
 
 # ─── TEST: Ollama Backup & OCR Caching ──────────────────────────────────────────

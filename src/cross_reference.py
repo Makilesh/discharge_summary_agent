@@ -331,11 +331,16 @@ def check_cr2_diagnosis_conflicts(state: dict) -> list[dict]:
         all_cc = set()
         for src in chief_complaints_sources:
             for c in src["complaints"]:
-                all_cc.add(c.strip().upper())
+                if isinstance(c, str) and c.strip():
+                    all_cc.add(c.strip().upper())
 
         # If substantially different complaint sets
         sets = [
-            {c.strip().upper() for c in src["complaints"]}
+            {
+                c.strip().upper()
+                for c in src["complaints"]
+                if isinstance(c, str) and c.strip()
+            }
             for src in chief_complaints_sources
         ]
         if len(sets) >= 2 and sets[0] != sets[1]:

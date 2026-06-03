@@ -68,8 +68,8 @@ EXTRACTION_PRIORITY_ORDER: list[str] = [
     "ADMISSION_RECORD",              # 2. Chief complaints, past history, provisional diagnosis
     "ER_OBSERVATION_CHART",          # 3. ER diagnosis (may differ from final — log conflict)
     "ICU_CHART",                     # 4. Critical meds, diagnoses written on ICU sheet
-    "CONSULTATION_SHEET",            # 5. Specialist opinions, evolving diagnoses
-    "DRUG_CHART",                    # 6. Full medication history, dates, doses, routes
+    "DRUG_CHART",                    # 5. Full medication history, dates, doses, routes
+    "CONSULTATION_SHEET",            # 6. Specialist opinions, evolving diagnoses
     "LAB_REPORT_BIOCHEMISTRY",       # 7a. Lab results
     "LAB_REPORT_HAEMATOLOGY",        # 7b.
     "LAB_REPORT_URINE",             # 7c.

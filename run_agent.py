@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.state import create_initial_state
 from src.graph import build_agent_graph
-from src.config import GOOGLE_API_KEY
+from src.config import GOOGLE_API_KEY, LLM_MODEL
 
 
 def main() -> None:
@@ -47,6 +47,11 @@ Examples:
         "--output", default="output",
         help="Output directory for results (default: output/)"
     )
+    parser.add_argument(
+        "--skip-llm-preflight",
+        action="store_true",
+        help="Skip the one-request Gemini preflight check. Use only when quota/model availability is already known."
+    )
     args = parser.parse_args()
 
     # Validate inputs
@@ -59,7 +64,11 @@ Examples:
     if is_dummy_key:
         print("WARNING: GOOGLE_API_KEY not set or dummy. Running with local Ollama backup (deepseek-r1:14b).")
     else:
-        print("GOOGLE_API_KEY detected. Running with Gemini 2.0 Flash (with Ollama backup).")
+        print(f"GOOGLE_API_KEY detected. Running with {LLM_MODEL} (with safe local fallback where applicable).")
+        if args.skip_llm_preflight:
+            print("Skipping Gemini preflight check by request.")
+        else:
+            _preflight_gemini()
 
     # Create output directory
     output_dir = Path(args.output)
@@ -71,7 +80,7 @@ Examples:
     print("=" * 70)
     print(f"\n  PDF:    {pdf_path}")
     print(f"  Output: {output_dir.resolve()}")
-    print(f"  Model:  {'Ollama deepseek-r1:14b' if is_dummy_key else 'Gemini 2.0 Flash'}")
+    print(f"  Model:  {'Ollama deepseek-r1:14b' if is_dummy_key else LLM_MODEL}")
     print(f"  Time:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"\n{'=' * 70}\n")
 
@@ -174,6 +183,25 @@ Examples:
     print(f"  Fabrication blocks:     {len(final_state.get('fabrication_blocks', []))}")
     print(f"  Summary status:         DRAFT — NOT FOR CLINICAL USE WITHOUT REVIEW")
     print(f"{'=' * 70}\n")
+
+
+def _preflight_gemini() -> None:
+    """Fail fast if the configured Gemini model/key cannot serve requests."""
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.messages import HumanMessage
+
+        llm = ChatGoogleGenerativeAI(
+            model=LLM_MODEL,
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.0,
+            max_output_tokens=8,
+        )
+        llm.invoke([HumanMessage(content="Return only OK.")])
+    except Exception as e:
+        print(f"ERROR: Gemini preflight failed for model {LLM_MODEL}: {e}")
+        print("       Fix GOOGLE_API_KEY/LLM_MODEL or wait for quota reset before running scanned-PDF extraction.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -314,7 +314,7 @@ def extract_page_text(image_b64: str, page_num: int) -> dict:
             header_pattern = f"=== PAGE {page_num} ==="
             clean_text = text.replace(header_pattern, "").strip()
             if len(clean_text) >= MIN_TEXT_LENGTH:
-                print(f"  ✓ Loaded Page {page_num} OCR text from local cache {cache_file} ({len(clean_text)} chars)")
+                print(f"  Loaded Page {page_num} OCR text from local cache {cache_file} ({len(clean_text)} chars)")
                 return {
                     "text": text,
                     "confidence": 1.0,
@@ -359,7 +359,7 @@ Where 1.0 = fully legible typed text, 0.5 = partially legible, 0.0 = completely 
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, "w", encoding="utf-8") as f:
             f.write(f"=== PAGE {page_num} ===\n\n{text}")
-        print(f"  ✓ Saved Page {page_num} OCR text to local cache {cache_file}")
+        print(f"  Saved Page {page_num} OCR text to local cache {cache_file}")
     except Exception as cache_err:
         print(f"[CACHE] Warning: Failed to save OCR cache for Page {page_num}: {cache_err}")
 

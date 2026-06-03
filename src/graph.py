@@ -92,37 +92,54 @@ def initialize_node(state: dict) -> dict:
     page_nums = sorted(page_images.keys())
     batch_size = 10  # Images per classification batch
 
-    for batch_start in range(0, len(page_nums), batch_size):
-        batch_pages = page_nums[batch_start:batch_start + batch_size]
-        batch_images = [
-            (pn, get_page_image_base64(page_images, pn))
-            for pn in batch_pages
-            if get_page_image_base64(page_images, pn) is not None
-        ]
+    cached_classifications = _load_classification_cache(cache_namespace, page_nums)
+    if cached_classifications is not None:
+        all_classifications = cached_classifications
+        emit_trace(
+            state=state,
+            step_number=step,
+            phase="INITIALIZE",
+            reasoning="Loaded page classifications from cache for this PDF",
+            action="CLASSIFICATION_CACHE_HIT",
+            observation=f"Loaded {len(all_classifications)} cached page classifications.",
+            decision="Proceeding without Gemini classification calls",
+        )
+    else:
+        for batch_start in range(0, len(page_nums), batch_size):
+            batch_pages = page_nums[batch_start:batch_start + batch_size]
+            batch_images = [
+                (pn, get_page_image_base64(page_images, pn))
+                for pn in batch_pages
+                if get_page_image_base64(page_images, pn) is not None
+            ]
 
-        if batch_images:
-            try:
-                classifications = classify_document_pages(batch_images)
-                all_classifications.extend(classifications)
-            except Exception as e:
-                # On classification failure, mark pages as UNKNOWN
-                for pn in batch_pages:
-                    all_classifications.append({
-                        "page_num": pn,
-                        "doc_type": "UNKNOWN",
-                        "confidence": 0.0,
-                    })
-                emit_trace(
-                    state=state,
-                    step_number=step,
-                    phase="INITIALIZE",
-                    reasoning=f"Classification batch failed for pages {batch_pages}",
-                    action="CLASSIFICATION_FAILED",
-                    observation=str(e)[:200],
-                    decision="Marking pages as UNKNOWN, continuing",
-                    fallback_taken=True,
-                    fallback_reason=str(e)[:200],
-                )
+            if batch_images:
+                try:
+                    classifications = classify_document_pages(batch_images)
+                    all_classifications.extend(classifications)
+                except Exception as e:
+                    # On classification failure, mark pages as UNKNOWN
+                    for pn in batch_pages:
+                        all_classifications.append({
+                            "page_num": pn,
+                            "doc_type": "UNKNOWN",
+                            "confidence": 0.0,
+                        })
+                    emit_trace(
+                        state=state,
+                        step_number=step,
+                        phase="INITIALIZE",
+                        reasoning=f"Classification batch failed for pages {batch_pages}",
+                        action="CLASSIFICATION_FAILED",
+                        observation=str(e)[:200],
+                        decision="Marking pages as UNKNOWN, continuing",
+                        fallback_taken=True,
+                        fallback_reason=str(e)[:200],
+                    )
+
+    all_classifications = _dedupe_and_sanitize_classifications(all_classifications)
+    if cached_classifications is None:
+        _save_classification_cache(cache_namespace, all_classifications)
 
     # Build document inventory
     loaded_documents: list[dict] = []
@@ -561,6 +578,18 @@ def _route_extracted_data(
         follow_up = extracted.get("follow_up", [])
         if follow_up:
             updates["follow_up_instructions"] = follow_up
+
+        # Typed discharge summaries usually contain the discharge medication
+        # advice list. Route those entries explicitly; drug charts remain
+        # inpatient/admission evidence for reconciliation.
+        if doc_type == "TYPED_DISCHARGE_SUMMARY":
+            meds = extracted.get("medications", [])
+            if isinstance(meds, list):
+                for med in meds:
+                    if isinstance(med, dict) and med.get("name"):
+                        med.setdefault("status", "DISCHARGE")
+                        med.setdefault("source_pages", [page_num])
+                        new_meds.append(med)
 
         # Condition at discharge
         condition = extracted.get("condition_at_discharge")
@@ -1109,6 +1138,80 @@ def _summarize_doc_types(loaded_documents: list[dict]) -> str:
         dt = doc.get("source_type", "UNKNOWN")
         type_counts[dt] = type_counts.get(dt, 0) + 1
     return ", ".join(f"{dt}({count})" for dt, count in sorted(type_counts.items()))
+
+
+def _dedupe_and_sanitize_classifications(classifications: list[dict]) -> list[dict]:
+    """
+    Keep one valid classification per page.
+
+    Gemini can occasionally repeat pages or emit near-taxonomy labels. Repeated
+    pages waste step budget; invalid labels bypass priority routing.
+    """
+    aliases = {
+        "NURSES_NOTES": "NURSING_NOTES",
+        "NURSE_NOTES": "NURSING_NOTES",
+        "NURSING_NOTE": "NURSING_NOTES",
+    }
+    by_page: dict[int, dict] = {}
+    for cls in classifications:
+        try:
+            page_num = int(cls.get("page_num", 0))
+        except (TypeError, ValueError):
+            continue
+        if page_num <= 0:
+            continue
+
+        doc_type = str(cls.get("doc_type", "UNKNOWN")).strip().upper()
+        doc_type = aliases.get(doc_type, doc_type)
+        if doc_type not in DOC_TYPES:
+            doc_type = "UNKNOWN"
+
+        try:
+            confidence = float(cls.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        normalized = {
+            "page_num": page_num,
+            "doc_type": doc_type,
+            "confidence": max(0.0, min(1.0, confidence)),
+        }
+        previous = by_page.get(page_num)
+        if previous is None or normalized["confidence"] > previous.get("confidence", 0.0):
+            by_page[page_num] = normalized
+
+    return [by_page[pn] for pn in sorted(by_page)]
+
+
+def _classification_cache_path(cache_namespace: str) -> str:
+    cache_root = os.getenv("OCR_CACHE_DIR", "output/ocr_cache")
+    return os.path.join(cache_root, cache_namespace, "classifications.json")
+
+
+def _load_classification_cache(cache_namespace: str, page_nums: list[int]) -> Optional[list[dict]]:
+    path = _classification_cache_path(cache_namespace)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        classifications = cached.get("classifications", [])
+        cleaned = _dedupe_and_sanitize_classifications(classifications)
+        if sorted(c["page_num"] for c in cleaned) == sorted(page_nums):
+            return cleaned
+    except Exception as e:
+        print(f"[CACHE] Warning: Failed to load classification cache {path}: {e}")
+    return None
+
+
+def _save_classification_cache(cache_namespace: str, classifications: list[dict]) -> None:
+    path = _classification_cache_path(cache_namespace)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"classifications": classifications}, f, indent=2)
+    except Exception as e:
+        print(f"[CACHE] Warning: Failed to save classification cache {path}: {e}")
 
 
 def _mark_unreadable(state: dict, updates: dict, page_num: int) -> None:
