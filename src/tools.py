@@ -496,7 +496,7 @@ EXTRACTION_CONFIDENCE: <0.0-1.0>
 
 Where 1.0 = fully legible typed text, 0.5 = partially legible, 0.0 = completely illegible."""
 
-    response = _call_vision_llm(prompt, [image_b64])
+    response = _call_ollama_vision(prompt, [image_b64])
 
     # Parse confidence from response
     confidence = 0.5  # Default

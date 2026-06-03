@@ -20,7 +20,7 @@ Clinical Safety:
 """
 
 from __future__ import annotations
-from typing import Literal, Optional
+from typing import Literal, Optional, Any
 import re
 
 from .config import CRITICAL_LAB_THRESHOLDS, CONFLICT_FIELD_TEMPLATE
@@ -221,16 +221,20 @@ def check_cr2_diagnosis_conflicts(state: dict) -> list[dict]:
     diagnosis_sources: list[dict] = []
 
     # From structured diagnoses field
-    diagnoses = state.get("diagnoses", {})
-    if diagnoses.get("provisional"):
+    diagnoses = state.get("diagnoses") or {}
+    prov = diagnoses.get("provisional")
+    if prov:
+        prov_list = prov if isinstance(prov, list) else [prov]
         diagnosis_sources.append({
             "source": "Structured — Provisional",
-            "diagnoses": diagnoses["provisional"],
+            "diagnoses": prov_list,
         })
-    if diagnoses.get("final"):
+    final = diagnoses.get("final")
+    if final:
+        final_list = final if isinstance(final, list) else [final]
         diagnosis_sources.append({
             "source": "Structured — Final",
-            "diagnoses": diagnoses["final"],
+            "diagnoses": final_list,
         })
 
     # From loaded documents
@@ -407,9 +411,8 @@ def check_cr3_lab_evidence(state: dict) -> list[dict]:
         if not value_str or value_str in ("PENDING", "AWAITED", "null", None):
             continue
 
-        try:
-            value = float(re.sub(r'[^\d.]', '', str(value_str)))
-        except (ValueError, TypeError):
+        value = _parse_float(value_str)
+        if value is None:
             continue
 
         # Check against critical thresholds
@@ -694,11 +697,14 @@ def check_cr5_discharge_condition(state: dict) -> list[dict]:
         last_vitals = _get_last_vitals(state)
         if last_vitals:
             vital_concerns = []
-            if last_vitals.get("pulse") and float(last_vitals["pulse"]) > 100:
+            pulse_val = _parse_float(last_vitals.get("pulse"))
+            if pulse_val is not None and pulse_val > 100:
                 vital_concerns.append(f"Tachycardia (pulse {last_vitals['pulse']})")
-            if last_vitals.get("bp_systolic") and float(last_vitals["bp_systolic"]) < 90:
+            bp_sys_val = _parse_float(last_vitals.get("bp_systolic"))
+            if bp_sys_val is not None and bp_sys_val < 90:
                 vital_concerns.append(f"Hypotension (SBP {last_vitals['bp_systolic']})")
-            if last_vitals.get("temperature") and float(last_vitals["temperature"]) > 99.5:
+            temp_val = _parse_float(last_vitals.get("temperature"))
+            if temp_val is not None and temp_val > 99.5:
                 vital_concerns.append(f"Fever (temp {last_vitals['temperature']})")
 
             if vital_concerns:
@@ -814,15 +820,40 @@ def _check_pending_blood_culture(state: dict, conflicts: list[dict]) -> None:
 
 # ─── HELPER FUNCTIONS ───────────────────────────────────────────────────────────
 
+def _parse_float(value: Any) -> Optional[float]:
+    """
+    Safely parse a numeric float value from various raw string inputs.
+    Handles units, suffixes, and slash characters (e.g., '116/m' -> 116, '87/50' -> 87, '99.5 F' -> 99.5).
+    """
+    if value is None:
+        return None
+    val_str = str(value).strip()
+    if not val_str:
+        return None
+    # Split on slash to take the leading portion (handles '116/m', '120/80')
+    val_str = val_str.split('/')[0].strip()
+    match = re.search(r'[-+]?(?:\d*\.\d+|\d+)', val_str)
+    if match:
+        try:
+            return float(match.group(0))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _get_all_diagnoses_text(state: dict) -> str:
     """Collect all diagnosis text from every source into a single searchable string."""
     parts: list[str] = []
 
     # From structured diagnoses
-    diagnoses = state.get("diagnoses", {})
+    diagnoses = state.get("diagnoses") or {}
     for category in ["principal", "secondary", "provisional", "final"]:
-        for d in diagnoses.get(category, []):
-            parts.append(str(d))
+        val = diagnoses.get(category)
+        if val:
+            if isinstance(val, list):
+                parts.extend(str(d) for d in val if d is not None)
+            else:
+                parts.append(str(val))
 
     # From loaded documents
     for doc in state.get("loaded_documents", []):

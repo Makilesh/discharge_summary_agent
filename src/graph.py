@@ -190,7 +190,7 @@ def initialize_node(state: dict) -> dict:
         "unreadable_pages": unreadable_pages,
         "page_images": page_images_b64,
         "processing_queue": processing_queue,
-        "steps_remaining": state.get("steps_remaining", MAX_ITERATIONS) - 2,
+        "steps_remaining": state.get("steps_remaining", MAX_ITERATIONS),
         "current_phase": "REASON",
         "trace": state.get("trace", [])[start_trace_len:],
     }
@@ -341,7 +341,6 @@ def call_tool_node(state: dict) -> dict:
     page_images = state.get("page_images", {})
 
     updates: dict = {
-        "steps_remaining": state["steps_remaining"] - 1,
         "current_phase": "OBSERVE",
     }
 
@@ -869,7 +868,6 @@ def verify_node(state: dict) -> dict:
 
     return {
         "current_phase": "VERIFY_DONE",
-        "steps_remaining": state["steps_remaining"] - 1,
         "trace": state.get("trace", [])[start_trace_len:],
     }
 
