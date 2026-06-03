@@ -351,7 +351,7 @@ def _do_extraction(state: dict, step: int, updates: dict) -> dict:
             confidence = 0.0
 
         if len(text) < MIN_TEXT_LENGTH:
-            updates.setdefault("unreadable_pages", []).append(page_num)
+            _mark_unreadable(state, updates, page_num)
             continue
 
         page_payloads.append({
@@ -1109,6 +1109,14 @@ def _summarize_doc_types(loaded_documents: list[dict]) -> str:
         dt = doc.get("source_type", "UNKNOWN")
         type_counts[dt] = type_counts.get(dt, 0) + 1
     return ", ".join(f"{dt}({count})" for dt, count in sorted(type_counts.items()))
+
+
+def _mark_unreadable(state: dict, updates: dict, page_num: int) -> None:
+    """Append an unreadable page once across current state and pending updates."""
+    existing = set(state.get("unreadable_pages", []))
+    pending = updates.setdefault("unreadable_pages", [])
+    if page_num not in existing and page_num not in pending:
+        pending.append(page_num)
 
 
 def _ocr_cache_namespace(pdf_path: str) -> str:

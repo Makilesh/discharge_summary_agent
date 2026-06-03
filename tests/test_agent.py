@@ -689,6 +689,31 @@ class TestGraphExtraction:
         assert len(queue[0]["pages"]) == BATCH_SIZE
         assert queue[1]["pages"] == [BATCH_SIZE + 1, BATCH_SIZE + 2]
 
+    def test_unreadable_pages_are_not_duplicated(self, monkeypatch, empty_state: dict):
+        """A page already marked unreadable during classification should not be duplicated."""
+        import src.graph as graph
+
+        monkeypatch.setattr(
+            graph,
+            "extract_page_text",
+            lambda img_b64, page_num: {"text": "", "confidence": 0.0, "page_num": page_num},
+        )
+
+        empty_state.update({
+            "_target_doc_type": "UNKNOWN",
+            "_target_pages": [1],
+            "page_images": {1: "img1"},
+            "unreadable_pages": [1],
+        })
+
+        updates = graph._do_extraction(
+            empty_state,
+            step=1,
+            updates={"steps_remaining": 10, "current_phase": "OBSERVE"},
+        )
+
+        assert updates.get("unreadable_pages", []) == []
+
     def test_drug_chart_uses_batch_extractor(self, monkeypatch, empty_state: dict):
         """Drug chart pages should be extracted with one batch call."""
         import src.graph as graph
