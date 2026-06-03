@@ -102,7 +102,7 @@ def initialize_node(state: dict) -> dict:
             reasoning="Loaded page classifications from cache for this PDF",
             action="CLASSIFICATION_CACHE_HIT",
             observation=f"Loaded {len(all_classifications)} cached page classifications.",
-            decision="Proceeding without Gemini classification calls",
+            decision="Proceeding without classification model calls",
         )
     else:
         for batch_start in range(0, len(page_nums), batch_size):
@@ -1247,12 +1247,18 @@ def _mark_unreadable(state: dict, updates: dict, page_num: int) -> None:
 
 
 def _ocr_cache_namespace(pdf_path: str) -> str:
-    """Build a stable cache namespace from the resolved PDF path."""
+    """Build a stable cache namespace from the resolved PDF path and LLM backend."""
     resolved = os.path.abspath(pdf_path or "unknown_pdf")
     digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
     stem = os.path.splitext(os.path.basename(resolved))[0]
     safe_stem = "".join(c if c.isalnum() else "_" for c in stem).strip("_") or "pdf"
-    return f"{safe_stem}_{digest}"
+    backend = os.getenv("LLM_BACKEND", "auto").strip().lower() or "auto"
+    reasoning = os.getenv("REASONING_BACKUP_MODEL", "reasoning").strip().lower()
+    vision = os.getenv("VISION_BACKUP_MODEL", "vision").strip().lower()
+    gemini = os.getenv("LLM_MODEL", "gemini").strip().lower()
+    model_scope = f"{backend}_{gemini}_{reasoning}_{vision}"
+    safe_scope = "".join(c if c.isalnum() else "_" for c in model_scope).strip("_")
+    return f"{safe_stem}_{digest}_{safe_scope}"
 
 
 # ─── BUILD THE GRAPH ─────────────────────────────────────────────────────────────
