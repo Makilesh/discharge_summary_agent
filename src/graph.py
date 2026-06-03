@@ -1028,7 +1028,7 @@ def _generate_hospital_course(state: dict) -> str:
         raw_text = doc.get("raw_text", "")
 
         if doc_type == "ER_OBSERVATION_CHART":
-            er_diag = extracted.get("er_diagnosis", [])
+            er_diag = _clean_text_items(extracted.get("er_diagnosis", []))
             if er_diag:
                 events.append(
                     (f"Patient presented to ER with provisional diagnosis of {', '.join(er_diag)}", page_num)
@@ -1042,16 +1042,16 @@ def _generate_hospital_course(state: dict) -> str:
                         )
 
         elif doc_type == "ICU_CHART":
-            icu_diag = extracted.get("icu_diagnoses", [])
+            icu_diag = _clean_text_items(extracted.get("icu_diagnoses", []))
             if icu_diag:
                 events.append(
                     (f"ICU admission with diagnoses: {', '.join(icu_diag)}", page_num)
                 )
 
         elif doc_type == "CONSULTATION_SHEET":
-            consult_diag = extracted.get("consultation_diagnosis", [])
+            consult_diag = _clean_text_items(extracted.get("consultation_diagnosis", []))
             consult_date = extracted.get("consultation_date", "")
-            recommendations = extracted.get("recommendations", [])
+            recommendations = _clean_text_items(extracted.get("recommendations", []))
             discharge_plan = extracted.get("discharge_plan", "")
 
             if consult_diag:
@@ -1088,6 +1088,30 @@ def _generate_hospital_course(state: dict) -> str:
         narrative_parts.append(f"{event_text} **[Page {page_num}]**.")
 
     return "\n\n".join(narrative_parts)
+
+
+def _clean_text_items(value) -> list[str]:
+    """Return non-empty string values from model output lists/scalars."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, list):
+        value = [value]
+
+    cleaned: list[str] = []
+    for item in value:
+        if item is None:
+            continue
+        if isinstance(item, dict):
+            text = item.get("text") or item.get("description") or item.get("value")
+            if text is None:
+                continue
+            item = text
+        text = str(item).strip()
+        if text and text.lower() != "none":
+            cleaned.append(text)
+    return cleaned
 
 
 # ─── HELPER FUNCTIONS ───────────────────────────────────────────────────────────

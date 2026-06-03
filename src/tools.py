@@ -330,7 +330,7 @@ Return ONLY the JSON array, no other text."""
 
 def extract_page_text(image_b64: str, page_num: int) -> dict:
     """
-    Extract all text from a single scanned page using Gemini Vision OCR.
+    Extract all text from a single scanned page using the configured vision OCR backend.
 
     Purpose:
         Full OCR extraction of a page, including handwritten text.

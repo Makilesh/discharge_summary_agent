@@ -137,7 +137,7 @@ Examples:
     agent = build_agent_graph()
 
     print("[3/4] Running agent (this may take several minutes)...")
-    print("      Processing 71-page scanned PDF with Gemini Vision OCR...")
+    print(f"      Processing scanned PDF with {model_label}...")
     print()
 
     start_time = time.time()
