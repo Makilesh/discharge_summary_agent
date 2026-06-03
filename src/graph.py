@@ -213,10 +213,52 @@ def reason_node(state: dict) -> dict:
     start_trace_len = len(state.get("trace", []))
     step = MAX_ITERATIONS - state.get("steps_remaining", MAX_ITERATIONS)
     queue = state.get("processing_queue", [])
+    has_medication_evidence = bool(
+        state.get("admission_medications")
+        or state.get("inpatient_medications")
+        or state.get("discharge_medications")
+    )
+    pending_medication_sources = any(
+        batch.get("doc_type") in {
+            "TYPED_DISCHARGE_SUMMARY",
+            "ADMISSION_RECORD",
+            "ICU_CHART",
+            "DRUG_CHART",
+        }
+        for batch in queue
+    )
+
+    if (
+        queue
+        and has_medication_evidence
+        and not state.get("medication_reconciliation")
+        and not pending_medication_sources
+    ):
+        reasoning = (
+            "Medication evidence is available and no higher-priority medication "
+            "source batches remain. Reconcile before lower-priority extraction "
+            "to satisfy the medication-safety requirement within the step cap."
+        )
+        decision = "Proceed to medication reconciliation"
+        emit_trace(
+            state=state,
+            step_number=step,
+            phase="REASON",
+            reasoning=reasoning,
+            action="PLAN",
+            decision=decision,
+        )
+
+        return {
+            "current_phase": "CALL_TOOL",
+            "steps_remaining": state["steps_remaining"] - 1,
+            "_next_action": "RECONCILE_MEDICATIONS",
+            "trace": state.get("trace", [])[start_trace_len:],
+        }
 
     if not queue:
         # All queue items processed — check if we need medication reconciliation
-        if not state.get("medication_reconciliation"):
+        if not state.get("medication_reconciliation") and has_medication_evidence:
             reasoning = (
                 "All document types have been processed. Now need to reconcile "
                 "medications and run cross-reference audit."

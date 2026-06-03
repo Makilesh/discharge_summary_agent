@@ -158,6 +158,48 @@ Rules:
         return "UNKNOWN"
 
 
+def _heuristic_doc_type_from_text(text: str) -> Optional[str]:
+    """Conservative text overrides for high-signal document anchors."""
+    normalized = re.sub(r"\s+", " ", text.lower())
+    if not normalized:
+        return None
+
+    discharge_signals = [
+        "condition at discharge",
+        "advice on discharge",
+        "course in the hospital",
+        "follow-up instructions",
+        "review immediately in case of",
+    ]
+    if (
+        "advice on discharge" in normalized
+        or "condition at discharge" in normalized
+        or ("diagnosis:" in normalized and "course in the hospital" in normalized)
+        or ("course in the hospital" in normalized and "follow-up" in normalized)
+    ):
+        return "TYPED_DISCHARGE_SUMMARY"
+
+    if "medication name" in normalized and "dosage" in normalized and "frequency" in normalized:
+        return "TYPED_DISCHARGE_SUMMARY"
+
+    if "urine culture" in normalized and "report awaited" in normalized:
+        return "TYPED_DISCHARGE_SUMMARY"
+
+    return None
+
+
+def _read_cached_ocr_text(page_num: int) -> str:
+    cache_file = get_ocr_cache_file(page_num)
+    if not cache_file.exists():
+        return ""
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+    except Exception:
+        return ""
+    return text.replace(f"=== PAGE {page_num} ===", "").strip()
+
+
 def _call_vision_llm(prompt: str, image_b64_list: list[str]) -> str:
     """
     Call Gemini Vision with text prompt and one or more page images.
@@ -280,6 +322,16 @@ Rules:
     if backend == "local":
         classifications = []
         for page_num, img_b64 in page_images_b64:
+            cached_text = _read_cached_ocr_text(page_num)
+            heuristic_type = _heuristic_doc_type_from_text(cached_text)
+            if heuristic_type:
+                classifications.append({
+                    "page_num": page_num,
+                    "doc_type": heuristic_type,
+                    "confidence": 0.95,
+                })
+                continue
+
             single_prompt = f"""You are a clinical document classifier. Classify this single page image from a hospital patient record.
 
 The page number is: {page_num}
@@ -304,6 +356,17 @@ Return ONLY this JSON object:
                 if isinstance(parsed, dict):
                     doc_type = str(parsed.get("doc_type", "UNKNOWN")).upper()
                     matched_type = next((dt for dt in DOC_TYPES if dt in doc_type), "UNKNOWN")
+                    if page_num <= 3 or matched_type in {"DRUG_CHART", "NURSING_ASSESSMENT", "UNKNOWN"}:
+                        ocr_text = cached_text
+                        if len(ocr_text) < MIN_TEXT_LENGTH:
+                            try:
+                                ocr_result = extract_page_text(img_b64, page_num)
+                                ocr_text = ocr_result.get("text", "").replace(f"=== PAGE {page_num} ===", "").strip()
+                            except Exception:
+                                ocr_text = ""
+                        heuristic_type = _heuristic_doc_type_from_text(ocr_text)
+                        if heuristic_type:
+                            matched_type = heuristic_type
                     confidence = parsed.get("confidence", 0.0)
                     try:
                         confidence = float(confidence)
@@ -361,7 +424,7 @@ def _classify_pages_from_text(page_images_b64: list[tuple[int, str]]) -> list[di
                 
         clean_text = page_text.replace(header_pattern, "").strip()
         if len(clean_text) >= MIN_TEXT_LENGTH:
-            doc_type = classify_page_from_text(clean_text)
+            doc_type = _heuristic_doc_type_from_text(clean_text) or classify_page_from_text(clean_text)
             classifications.append({
                 "page_num": page_num,
                 "doc_type": doc_type,
