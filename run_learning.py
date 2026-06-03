@@ -78,7 +78,7 @@ def _load_or_run_part1(pdf_path: str, output_dir: str) -> dict:
     current_state = dict(initial_state)
 
     try:
-        for event in agent.stream(initial_state, {"recursion_limit": 50}):
+        for event in agent.stream(initial_state, {"recursion_limit": 150}):
             for node_name, node_output in event.items():
                 for k, v in node_output.items():
                     if k in (

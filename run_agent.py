@@ -147,7 +147,7 @@ Examples:
         step_count = 0
         current_state = dict(initial_state)
 
-        for event in agent.stream(initial_state, {"recursion_limit": 50}):
+        for event in agent.stream(initial_state, {"recursion_limit": 150}):
             step_count += 1
             for node_name, node_output in event.items():
                 phase = node_output.get("current_phase", "")

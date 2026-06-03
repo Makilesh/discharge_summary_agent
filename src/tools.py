@@ -221,6 +221,8 @@ def _call_vision_llm(prompt: str, image_b64_list: list[str]) -> str:
                     "image_url": {"url": f"data:image/png;base64,{img_b64}"},
                 })
             msg = HumanMessage(content=content)
+            import time
+            time.sleep(4.5)
             response = llm.invoke([msg])
             return response.content
         except Exception as e:
