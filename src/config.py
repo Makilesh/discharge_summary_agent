@@ -22,6 +22,12 @@ load_dotenv()
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-2.0-flash")
 LLM_TEMPERATURE: float = 0.0  # Deterministic for clinical safety — no creative sampling
+LLM_BACKEND: str = os.getenv("LLM_BACKEND", "auto").lower()
+# LLM_BACKEND: "auto" tries Gemini first, then local Ollama. "gemini" disables local
+# fallback. "local" uses Ollama only.
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+REASONING_BACKUP_MODEL: str = os.getenv("REASONING_BACKUP_MODEL", "deepseek-r1:14b")
+VISION_BACKUP_MODEL: str = os.getenv("VISION_BACKUP_MODEL", "qwen2.5vl:7b")
 
 # ─── AGENT CONTROL ───────────────────────────────────────────────────────────────
 
