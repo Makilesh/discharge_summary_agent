@@ -25,7 +25,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.state import create_initial_state
 from src.graph import build_agent_graph
-from src.config import GOOGLE_API_KEY, LLM_MODEL
+from src.config import (
+    GOOGLE_API_KEY, LLM_MODEL, LLM_BACKEND,
+    OLLAMA_BASE_URL, REASONING_BACKUP_MODEL, VISION_BACKUP_MODEL,
+)
 
 
 def main() -> None:
@@ -52,7 +55,34 @@ Examples:
         action="store_true",
         help="Skip the one-request Gemini preflight check. Use only when quota/model availability is already known."
     )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "gemini", "local"],
+        default=None,
+        help="LLM backend: auto=Gemini then Ollama fallback, gemini=Gemini only, local=Ollama only."
+    )
+    parser.add_argument(
+        "--gemini-model",
+        default=None,
+        help="Gemini model name, e.g. gemini-2.5-flash-lite."
+    )
+    parser.add_argument(
+        "--reasoning-model",
+        default=None,
+        help="Ollama text reasoning model, default deepseek-r1:14b."
+    )
+    parser.add_argument(
+        "--vision-model",
+        default=None,
+        help="Ollama vision/OCR model, default qwen2.5vl:7b."
+    )
+    parser.add_argument(
+        "--ollama-base-url",
+        default=None,
+        help="Ollama OpenAI-compatible base URL."
+    )
     args = parser.parse_args()
+    _apply_runtime_llm_config(args)
 
     # Validate inputs
     pdf_path = Path(args.pdf).resolve()
@@ -60,15 +90,23 @@ Examples:
         print(f"ERROR: PDF file not found: {pdf_path}")
         sys.exit(1)
 
-    is_dummy_key = not GOOGLE_API_KEY or "your-google-api-key" in GOOGLE_API_KEY
-    if is_dummy_key:
-        print("WARNING: GOOGLE_API_KEY not set or dummy. Running with local Ollama backup (deepseek-r1:14b).")
+    backend = os.getenv("LLM_BACKEND", LLM_BACKEND).lower()
+    gemini_model = os.getenv("LLM_MODEL", LLM_MODEL)
+    reasoning_model = os.getenv("REASONING_BACKUP_MODEL", REASONING_BACKUP_MODEL)
+    vision_model = os.getenv("VISION_BACKUP_MODEL", VISION_BACKUP_MODEL)
+    google_api_key = os.getenv("GOOGLE_API_KEY", GOOGLE_API_KEY)
+    is_dummy_key = not google_api_key or "your-google-api-key" in google_api_key
+
+    if backend == "local":
+        print(f"Using local Ollama backend: reasoning={reasoning_model}, vision={vision_model}.")
+    elif is_dummy_key:
+        print(f"WARNING: GOOGLE_API_KEY not set or dummy. Running with local Ollama fallback: reasoning={reasoning_model}, vision={vision_model}.")
     else:
-        print(f"GOOGLE_API_KEY detected. Running with {LLM_MODEL} (with safe local fallback where applicable).")
+        print(f"GOOGLE_API_KEY detected. Backend={backend}. Gemini={gemini_model}; local fallback reasoning={reasoning_model}, vision={vision_model}.")
         if args.skip_llm_preflight:
             print("Skipping Gemini preflight check by request.")
         else:
-            _preflight_gemini()
+            _preflight_gemini(gemini_model, google_api_key)
 
     # Create output directory
     output_dir = Path(args.output)
@@ -80,7 +118,12 @@ Examples:
     print("=" * 70)
     print(f"\n  PDF:    {pdf_path}")
     print(f"  Output: {output_dir.resolve()}")
-    print(f"  Model:  {'Ollama deepseek-r1:14b' if is_dummy_key else LLM_MODEL}")
+    model_label = (
+        f"Ollama reasoning={reasoning_model}, vision={vision_model}"
+        if backend == "local" or is_dummy_key else
+        f"{gemini_model} ({backend}; fallback reasoning={reasoning_model}, vision={vision_model})"
+    )
+    print(f"  Model:  {model_label}")
     print(f"  Time:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"\n{'=' * 70}\n")
 
@@ -185,21 +228,45 @@ Examples:
     print(f"{'=' * 70}\n")
 
 
-def _preflight_gemini() -> None:
+def _apply_runtime_llm_config(args: argparse.Namespace) -> None:
+    """Apply CLI LLM choices before graph execution."""
+    if args.backend:
+        os.environ["LLM_BACKEND"] = args.backend
+    else:
+        os.environ.setdefault("LLM_BACKEND", LLM_BACKEND)
+    if args.gemini_model:
+        os.environ["LLM_MODEL"] = args.gemini_model
+    else:
+        os.environ.setdefault("LLM_MODEL", LLM_MODEL)
+    if args.reasoning_model:
+        os.environ["REASONING_BACKUP_MODEL"] = args.reasoning_model
+    else:
+        os.environ.setdefault("REASONING_BACKUP_MODEL", REASONING_BACKUP_MODEL)
+    if args.vision_model:
+        os.environ["VISION_BACKUP_MODEL"] = args.vision_model
+    else:
+        os.environ.setdefault("VISION_BACKUP_MODEL", VISION_BACKUP_MODEL)
+    if args.ollama_base_url:
+        os.environ["OLLAMA_BASE_URL"] = args.ollama_base_url
+    else:
+        os.environ.setdefault("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
+
+
+def _preflight_gemini(model_name: str, google_api_key: str) -> None:
     """Fail fast if the configured Gemini model/key cannot serve requests."""
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain_core.messages import HumanMessage
 
         llm = ChatGoogleGenerativeAI(
-            model=LLM_MODEL,
-            google_api_key=GOOGLE_API_KEY,
+            model=model_name,
+            google_api_key=google_api_key,
             temperature=0.0,
             max_output_tokens=8,
         )
         llm.invoke([HumanMessage(content="Return only OK.")])
     except Exception as e:
-        print(f"ERROR: Gemini preflight failed for model {LLM_MODEL}: {e}")
+        print(f"ERROR: Gemini preflight failed for model {model_name}: {e}")
         print("       Fix GOOGLE_API_KEY/LLM_MODEL or wait for quota reset before running scanned-PDF extraction.")
         sys.exit(1)
 
