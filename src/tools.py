@@ -272,11 +272,58 @@ Rules:
 - Handwritten pages should still be classified by their form type (e.g., nursing notes, drug chart).
 - Be specific: prefer "LAB_REPORT_BIOCHEMISTRY" over generic "LAB_REPORT" when distinguishable.
 
-Return ONLY the JSON array, no other text."""
+    Return ONLY the JSON array, no other text."""
 
     images = [img for _, img in page_images_b64]
+    backend = get_backend()
+
+    if backend == "local":
+        classifications = []
+        for page_num, img_b64 in page_images_b64:
+            single_prompt = f"""You are a clinical document classifier. Classify this single page image from a hospital patient record.
+
+The page number is: {page_num}
+
+Choose exactly one document type from this taxonomy:
+{doc_types_str}
+
+Rules:
+- If the page is mostly illegible or blank, classify as "UNKNOWN" with low confidence.
+- If a page contains multiple types, classify by the PRIMARY content type.
+- Handwritten pages should still be classified by their form type, such as NURSING_NOTES or DRUG_CHART.
+- Medication administration sheets/treatment charts should be classified as DRUG_CHART.
+- Be specific: prefer "LAB_REPORT_BIOCHEMISTRY" over generic lab types when distinguishable.
+
+Return ONLY this JSON object:
+{{"page_num": {page_num}, "doc_type": "<string from taxonomy>", "confidence": <float 0.0-1.0>}}"""
+            try:
+                response = _call_vision_llm(single_prompt, [img_b64])
+                parsed = _parse_json_response(response)
+                if isinstance(parsed, list) and parsed:
+                    parsed = parsed[0]
+                if isinstance(parsed, dict):
+                    doc_type = str(parsed.get("doc_type", "UNKNOWN")).upper()
+                    matched_type = next((dt for dt in DOC_TYPES if dt in doc_type), "UNKNOWN")
+                    confidence = parsed.get("confidence", 0.0)
+                    try:
+                        confidence = float(confidence)
+                    except (TypeError, ValueError):
+                        confidence = 0.0
+                    classifications.append({
+                        "page_num": int(parsed.get("page_num") or page_num),
+                        "doc_type": matched_type,
+                        "confidence": max(0.0, min(1.0, confidence)),
+                    })
+                    continue
+            except Exception as e:
+                print(f"[CLASSIFY] Local vision classification failed for page {page_num}: {e}. Falling back to OCR text.")
+
+            classifications.extend(_classify_pages_from_text([(page_num, img_b64)]))
+
+        return classifications
     
-    is_dummy_key = not GOOGLE_API_KEY or "your-google-api-key" in GOOGLE_API_KEY
+    google_api_key = _env("GOOGLE_API_KEY", GOOGLE_API_KEY)
+    is_dummy_key = not google_api_key or "your-google-api-key" in google_api_key
     
     if not is_dummy_key:
         try:
@@ -287,8 +334,12 @@ Return ONLY the JSON array, no other text."""
         except Exception as e:
             print(f"[CLASSIFY] Gemini Vision classification failed: {e}. Falling back to text-based classification...")
 
-    # Fallback: classify based on page texts using Ollama deepseek-r1:14b
-    print("[CLASSIFY] Running text-based classification via Ollama deepseek-r1:14b...")
+    return _classify_pages_from_text(page_images_b64)
+
+
+def _classify_pages_from_text(page_images_b64: list[tuple[int, str]]) -> list[dict]:
+    """Fallback classifier based on OCR text and the configured reasoning model."""
+    print(f"[CLASSIFY] Running text-based classification via Ollama {get_reasoning_model_name()}...")
     classifications = []
     for page_num, img_b64 in page_images_b64:
         cache_file = get_ocr_cache_file(page_num)
