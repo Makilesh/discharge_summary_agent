@@ -620,6 +620,13 @@ def _route_extracted_data(
         follow_up = extracted.get("follow_up", [])
         if follow_up:
             updates["follow_up_instructions"] = follow_up
+            pending_from_follow_up = [
+                item for item in follow_up
+                if isinstance(item, str)
+                and any(token in item.lower() for token in ["awaited", "pending", "sent", "report"])
+            ]
+            if pending_from_follow_up:
+                updates.setdefault("pending_results", []).extend(pending_from_follow_up)
 
         # Typed discharge summaries usually contain the discharge medication
         # advice list. Route those entries explicitly; drug charts remain
