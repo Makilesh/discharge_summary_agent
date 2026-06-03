@@ -267,32 +267,51 @@ def check_cr2_diagnosis_conflicts(state: dict) -> list[dict]:
     if len(diagnosis_sources) > 1:
         all_diag_sets = []
         for src in diagnosis_sources:
-            diag_set = {d.strip().upper() for d in src["diagnoses"] if d}
+            diag_set = set()
+            for d in src["diagnoses"]:
+                if d is not None:
+                    d_str = str(d).strip()
+                    if d_str and d_str.lower() not in ("null", "none", ""):
+                        diag_set.add(d_str.upper())
             all_diag_sets.append((src["source"], diag_set))
 
-        # Check for materially different diagnoses across sources
-        all_diagnoses_combined = set()
-        for _, ds in all_diag_sets:
-            all_diagnoses_combined.update(ds)
+        # Identify final/discharge diagnoses (the official list)
+        final_diag_set = set()
+        final_sources = []
+        for src_name, diag_set in all_diag_sets:
+            if "Final" in src_name or "TYPED_DISCHARGE_SUMMARY" in src_name:
+                final_diag_set.update(diag_set)
+                final_sources.append(src_name)
 
-        # If different sources have substantially different diagnosis sets
-        for i, (src_a, set_a) in enumerate(all_diag_sets):
-            for j, (src_b, set_b) in enumerate(all_diag_sets):
-                if i >= j:
+        # Check other sources against the final diagnoses to find un-reconciled issues
+        if final_diag_set:
+            for src_name, diag_set in all_diag_sets:
+                # Skip the final list itself
+                if "Final" in src_name or "TYPED_DISCHARGE_SUMMARY" in src_name:
                     continue
-                # Find diagnoses in A but not B (using substring matching)
-                unique_to_a = set_a - set_b
-                unique_to_b = set_b - set_a
-                if unique_to_a or unique_to_b:
+
+                unreconciled = []
+                for d in diag_set:
+                    # Spacing and substring-tolerant match
+                    represented = False
+                    d_norm = d.replace(" ", "")
+                    for f in final_diag_set:
+                        f_norm = f.replace(" ", "")
+                        if d_norm in f_norm or f_norm in d_norm:
+                            represented = True
+                            break
+                    if not represented:
+                        unreconciled.append(d)
+
+                if unreconciled:
                     conflict = {
                         "type": "DIAGNOSIS_MISMATCH",
-                        "sources": [src_a, src_b],
+                        "sources": [src_name] + final_sources[:1],
                         "description": (
-                            f"Diagnosis conflict: {src_a} records {list(set_a)[:5]}, "
-                            f"but {src_b} records {list(set_b)[:5]}. "
-                            f"Unique to {src_a}: {list(unique_to_a)[:3]}. "
-                            f"Unique to {src_b}: {list(unique_to_b)[:3]}. "
-                            f"These are materially different and cannot be arbitrarily resolved."
+                            f"Diagnosis conflict: Provisional source '{src_name}' records {list(diag_set)[:5]}, "
+                            f"but final discharge diagnoses records {list(final_diag_set)[:5]}. "
+                            f"The following provisional diagnosis is not reconciled in the final list: {unreconciled}. "
+                            f"Clinician must review and determine if it should be added to final diagnoses."
                         ),
                         "resolution": "ESCALATED",
                         "rule": "CR-2",
@@ -310,7 +329,7 @@ def check_cr2_diagnosis_conflicts(state: dict) -> list[dict]:
                 "the correct diagnosis set."
             ),
             source_evidence=[
-                f"{src['source']}: {', '.join(src['diagnoses'][:3])}"
+                f"{src['source']}: {', '.join(str(d) for d in src['diagnoses'] if d)[:100]}"
                 for src in diagnosis_sources[:5]
             ],
             source_pages=[],
