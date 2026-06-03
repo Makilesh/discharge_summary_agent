@@ -112,8 +112,12 @@ Examples:
         """
     )
     parser.add_argument(
-        "--pdf", required=True,
-        help="Path to the patient PDF file"
+        "--pdf", required=False, default=None,
+        help="Path to the patient PDF file (optional if --state is provided)"
+    )
+    parser.add_argument(
+        "--state", required=False, default=None,
+        help="Path to a cached Part 1 state.json (skips PDF processing)"
     )
     parser.add_argument(
         "--n-train", type=int, default=10,
@@ -137,10 +141,33 @@ Examples:
     random.seed(args.seed)
 
     # Validate inputs
-    pdf_path = Path(args.pdf).resolve()
-    if not pdf_path.exists():
-        print(f"ERROR: PDF file not found: {pdf_path}")
-        sys.exit(1)
+    if args.state:
+        state_path = Path(args.state).resolve()
+        if not state_path.exists():
+            print(f"ERROR: State file not found: {state_path}")
+            sys.exit(1)
+        pdf_path = Path(args.pdf).resolve() if args.pdf else Path("N/A")
+    elif args.pdf:
+        pdf_path = Path(args.pdf).resolve()
+        if not pdf_path.exists():
+            # Check if cached state exists as fallback
+            cached = Path("output/state.json")
+            if cached.exists():
+                print(f"  ⚠ PDF not found at {pdf_path}, but cached state.json exists. Using cached state.")
+                args.state = str(cached)
+            else:
+                print(f"ERROR: PDF file not found: {pdf_path}")
+                sys.exit(1)
+    else:
+        # Neither --pdf nor --state: check for default cached state
+        cached = Path("output/state.json")
+        if cached.exists():
+            print(f"  Using cached state from output/state.json")
+            args.state = str(cached)
+            pdf_path = Path("N/A")
+        else:
+            print("ERROR: Must provide either --pdf or --state")
+            sys.exit(1)
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -186,7 +213,12 @@ Examples:
 
     # Step 1: Load or run Part 1
     print("[1/4] Loading Part 1 agent state...")
-    agent_state = _load_or_run_part1(str(pdf_path), "output")
+    if args.state:
+        with open(args.state, "r", encoding="utf-8") as f:
+            agent_state = json.load(f)
+        print(f"  ✓ Loaded state directly from {args.state}")
+    else:
+        agent_state = _load_or_run_part1(str(pdf_path), "output")
     print(f"  ✓ State loaded. Phase: {agent_state.get('current_phase', '?')}")
     print(f"  ✓ Documents: {len(agent_state.get('loaded_documents', []))} loaded")
     print(f"  ✓ Conflicts: {len(agent_state.get('conflicts', []))}")
