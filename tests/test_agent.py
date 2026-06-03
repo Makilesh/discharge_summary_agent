@@ -853,20 +853,68 @@ class TestGraphExtraction:
 class TestOllamaBackup:
     """Tests for Ollama backup and OCR text caching."""
 
-    def test_text_only_backup_refuses_image_input(self, monkeypatch):
-        """A non-vision fallback must not hallucinate OCR for image inputs."""
+    def test_local_backend_routes_image_input_to_vision_model(self, monkeypatch):
+        """Image requests should use the configured Ollama vision model."""
         import src.tools as tools
 
-        class FailingGemini:
-            def invoke(self, messages):
-                raise RuntimeError("quota exhausted")
+        calls = []
 
-        monkeypatch.setattr(tools, "GOOGLE_API_KEY", "real-looking-key")
-        monkeypatch.setattr(tools, "_llm", None)
-        monkeypatch.setattr(tools, "get_llm", lambda: FailingGemini())
+        def fake_vision(prompt, image_b64_list):
+            calls.append((prompt, image_b64_list, tools.get_vision_model_name()))
+            return "VISION_OK"
 
-        with pytest.raises(RuntimeError, match="text-only"):
-            tools._call_vision_llm("classify this page", ["fake-image-b64"])
+        monkeypatch.setenv("LLM_BACKEND", "local")
+        monkeypatch.setenv("VISION_BACKUP_MODEL", "qwen2.5vl:7b")
+        monkeypatch.setattr(tools, "_call_ollama_vision", fake_vision)
+
+        result = tools._call_vision_llm("classify this page", ["fake-image-b64"])
+
+        assert result == "VISION_OK"
+        assert calls == [("classify this page", ["fake-image-b64"], "qwen2.5vl:7b")]
+
+    def test_local_backend_routes_text_to_reasoning_model(self, monkeypatch):
+        """Text-only requests should use the configured reasoning model."""
+        import src.tools as tools
+
+        calls = []
+
+        def fake_text(prompt, model=None):
+            calls.append((prompt, model or tools.get_reasoning_model_name()))
+            return "TEXT_OK"
+
+        monkeypatch.setenv("LLM_BACKEND", "local")
+        monkeypatch.setenv("REASONING_BACKUP_MODEL", "deepseek-r1:14b")
+        monkeypatch.setattr(tools, "_call_ollama_text", fake_text)
+
+        result = tools._call_vision_llm("parse this text", [])
+
+        assert result == "TEXT_OK"
+        assert calls == [("parse this text", "deepseek-r1:14b")]
+
+    def test_cli_runtime_llm_config(self, monkeypatch):
+        """run_agent CLI options should set backend/model environment variables."""
+        import os
+        from argparse import Namespace
+        from run_agent import _apply_runtime_llm_config
+
+        for key in [
+            "LLM_BACKEND", "LLM_MODEL", "REASONING_BACKUP_MODEL",
+            "VISION_BACKUP_MODEL", "OLLAMA_BASE_URL",
+        ]:
+            monkeypatch.delenv(key, raising=False)
+
+        _apply_runtime_llm_config(Namespace(
+            backend="local",
+            gemini_model="gemini-2.5-flash-lite",
+            reasoning_model="deepseek-r1:14b",
+            vision_model="qwen2.5vl:7b",
+            ollama_base_url="http://localhost:11434/v1",
+        ))
+
+        assert os.environ["LLM_BACKEND"] == "local"
+        assert os.environ["LLM_MODEL"] == "gemini-2.5-flash-lite"
+        assert os.environ["REASONING_BACKUP_MODEL"] == "deepseek-r1:14b"
+        assert os.environ["VISION_BACKUP_MODEL"] == "qwen2.5vl:7b"
 
     def test_classify_page_from_text_fallback(self):
         """Test classifying a page from its text using Ollama."""
