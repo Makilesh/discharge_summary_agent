@@ -109,13 +109,132 @@ python run_agent.py --pdf "patient 2 (1).pdf" --output output/
 - **OCR quality**: Gemini Vision handles handwriting reasonably well, but heavily degraded scans may produce low-confidence extractions. These are flagged, not silently dropped.
 - **Step budget**: The 20-step cap may not be sufficient for very large PDFs. The agent prioritizes high-value documents first and compiles whatever it has if the cap is hit.
 - **Drug interaction lookup**: Currently mocked. In production, this would integrate with a clinical pharmacopeia database.
-- **No learning loop**: Part 2 (learning from doctor edits) is not implemented in this submission.
+- **No learning loop**: ~~Part 2 (learning from doctor edits) is not implemented in this submission.~~ **Now implemented — see Part 2 below.**
 
 ## What I'd Do With More Time
 
-1. **Part 2**: Implement the doctor-edit learning loop with a simulated reviewer and contextual bandit over prompt strategies.
+1. ~~**Part 2**: Implement the doctor-edit learning loop with a simulated reviewer and contextual bandit over prompt strategies.~~ **Done.**
 2. **Multi-patient batch mode**: Process multiple patient PDFs in parallel.
 3. **Confidence-weighted extraction**: Re-read low-confidence pages with different prompting strategies.
 4. **Real drug interaction API**: Replace the mock with a real pharmacopeia integration.
 5. **Structured output validation**: Use Pydantic models to validate every tool's JSON output.
 6. **Token budget tracking**: Monitor LLM token usage and optimize prompts for cost.
+
+---
+
+## Part 2 — Learning from Doctor Edits
+
+### Architecture
+
+```
+                    ┌─────────────────────────┐
+                    │   LearningOrchestrator   │
+                    │   (learning_loop.py)     │
+                    └───────────┬─────────────┘
+                                │
+        ┌───────────┬───────────┼───────────┬──────────────┐
+        ▼           ▼           ▼           ▼              ▼
+  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+  │ Contextual│ │Simulated │ │  Edit    │ │Correction│ │  Gaming  │
+  │  Bandit   │ │ Reviewer │ │  Signal  │ │  Memory  │ │ Detector │
+  │(bandit.py)│ │(sim_rev) │ │(edit_sig)│ │(corr_mem)│ │(bandit)  │
+  └─────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
+        │             │            │             │            │
+        │  select_arm │  review()  │ compute()   │ retrieve() │ check()
+        ▼             ▼            ▼             ▼            ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                    Per-Iteration Pipeline                       │
+  │  1. Bandit selects arm → 2. Compile with strategy              │
+  │  3. Reviewer edits → 4. Compute reward → 5. Update memory      │
+  │  6. Update bandit → 7. Check for gaming                        │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+### New Modules
+
+| Module | File | Purpose |
+|--------|------|---------|
+| **EditSignalEngine** | `src/edit_signal.py` | Weighted composite reward: `R = 0.35*R_SED + 0.35*R_SEC + 0.15*R_PEND + 0.15*R_SAFE` |
+| **SimulatedReviewer** | `src/simulated_reviewer.py` | 7 deterministic rules + LLM correction with fabrication guard |
+| **CorrectionMemoryBank** | `src/correction_memory.py` | JSONL-backed persistent store with two-stage retrieval |
+| **ContextualBandit** | `src/bandit.py` | UCB1 over 5 prompt strategy arms |
+| **LearningOrchestrator** | `src/learning_loop.py` | Training loop + held-out evaluation + output artifacts |
+
+### Reward Function
+
+The composite reward combines 4 clinically meaningful sub-signals:
+
+| Sub-signal | Weight | What it measures |
+|-----------|--------|-----------------|
+| **R_SED** | 0.35 | Normalized edit distance (lower edits → higher reward) |
+| **R_SEC** | 0.35 | Section-level accuracy on 7 critical sections |
+| **R_PEND** | 0.15 | Pending results coverage |
+| **R_SAFE** | 0.15 | Safety flag preservation (binary: 0.0 or 1.0) |
+
+**Safety Clamp:** If `R_SAFE = 0.0` (any escalation flag was dropped), the composite reward is clamped to `max(R, 0.10)` regardless of other sub-scores.
+
+### Quick Start — Part 2
+
+```bash
+# Run the learning loop (10 iterations)
+python run_learning.py --pdf "patient 2 (1).pdf"
+
+# Custom iterations + output directory
+python run_learning.py --pdf "patient 2 (1).pdf" --n-train 10 --output output/part2/
+
+# Exploit-only mode (skip exploration)
+python run_learning.py --pdf "patient 2 (1).pdf" --exploit-only
+
+# Run Part 2 tests
+python -m pytest tests/test_part2.py -v
+```
+
+### Output Artifacts
+
+| File | Contents |
+|------|----------|
+| `training_curve.json` | Per-iteration metrics (arm, reward, sub-signals) |
+| `before_after_report.md` | Baseline vs best arm comparison with metric tables |
+| `improvement_curve.png` | Visual learning curve with arm color coding |
+| `correction_memory_summary.md` | Top-10 correction patterns by impact |
+| `limitations_analysis.md` | 5 failure modes with evidence from the run |
+| `gaming_alerts.log` | Gaming detector alerts (may be empty) |
+| `run_manifest.json` | Run ID, git hash, CLI args, timing |
+| `reviewer_prompt_used.txt` | Version-controlled reviewer system prompt |
+
+### Part 2 Limitations
+
+See `output/part2/limitations_analysis.md` for a detailed analysis with evidence from the run. Key limitations:
+
+1. **Cold-start problem** — First 5 iterations are pure exploration
+2. **Single-patient overfitting** — All training on patient_2's clinical profile
+3. **Metric gaming** — Vagueness could game R_SED (mitigated by GamingDetector)
+4. **Reviewer fabrication** — LLM corrections guarded but not semantically verified
+5. **Reward-safety tradeoff** — R_SAFE is binary, doesn't check flag content
+
+### Before/After Metrics (Actual Run)
+
+| Metric | Value |
+|--------|-------|
+| Iterations completed | 10 |
+| Mean composite reward | 0.9934 |
+| R_SED (edit distance) | 0.981 |
+| R_SEC (section accuracy) | 1.000 |
+| R_PEND (pending results) | 1.000 |
+| R_SAFE (safety flags) | 1.000 |
+| Safety clamps triggered | 0 |
+| Fabrication blocks | 0 |
+| Gaming alerts | 0 |
+| Best arm | BASELINE |
+| Improvement delta | +0.0000 |
+| Runtime | 361.5s |
+
+The flat reward curve reflects the high quality of Part 1's draft — the only consistent correction is REV-006 (allergies `[MISSING]` → `NOT KNOWN`). With a multi-patient training corpus, arm differentiation would emerge.
+
+### What I'd Do With More Time (Part 2)
+
+1. **Multi-patient training corpus**: Train across 10+ diverse patient profiles to break arm symmetry and demonstrate real learning differentiation.
+2. **Exponential backoff for rate limits**: Add retry logic with exponential backoff to `_run_llm_correction_pass` to gracefully handle API quota limits mid-run.
+3. **Semantic citation verification**: Cross-reference each LLM correction's `source_citation` against the actual page content to catch plausible but fabricated citations.
+4. **Thompson Sampling alternative**: Implement Thompson Sampling alongside UCB1 and compare regret bounds on the same patient corpus.
+5. **Sliding window bandit**: Use a sliding window over the last K iterations to handle non-stationary reward distributions as correction patterns evolve.
