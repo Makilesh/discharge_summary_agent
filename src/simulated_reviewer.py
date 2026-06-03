@@ -48,11 +48,11 @@ CRITICAL RULES:
 
 Return a JSON array of corrections:
 [
-    {
+    {{
         "section": "<section name>",
         "change": "<description of the correction>",
         "source_citation": "<Page N or document reference>"
-    }
+    }}
 ]
 
 If no corrections are needed for a section, omit it from the array.
