@@ -610,6 +610,7 @@ class TestGraphExtraction:
         LangGraph must preserve the planned document type and pages; otherwise
         CALL_TOOL silently extracts zero pages.
         """
+        import os
         from src.graph import build_agent_graph
 
         monkeypatch.setattr(
@@ -647,16 +648,46 @@ class TestGraphExtraction:
         state["_pdf_path"] = "dummy.pdf"
         agent = build_agent_graph()
 
-        call_tool_output = None
-        for event in agent.stream(state, {"recursion_limit": 10}):
-            if "call_tool" in event:
-                call_tool_output = event["call_tool"]
-                break
+        try:
+            call_tool_output = None
+            for event in agent.stream(state, {"recursion_limit": 10}):
+                if "call_tool" in event:
+                    call_tool_output = event["call_tool"]
+                    break
+        finally:
+            os.environ.pop("OCR_CACHE_NAMESPACE", None)
 
         assert call_tool_output is not None
         assert call_tool_output["loaded_documents"][0]["page_num"] == 1
         assert call_tool_output["loaded_documents"][0]["source_type"] == "TYPED_DISCHARGE_SUMMARY"
         assert call_tool_output["extracted_demographics"]["name"] == "TEST PATIENT"
+
+    def test_unknown_pages_are_queued_for_late_extraction(self):
+        """UNKNOWN pages should not be silently dropped from the processing queue."""
+        from src.graph import _build_processing_queue
+
+        queue = _build_processing_queue([
+            {"page_num": 1, "source_type": "UNKNOWN"},
+            {"page_num": 2, "source_type": "DRUG_CHART"},
+        ])
+
+        assert queue[0] == {"doc_type": "DRUG_CHART", "pages": [2]}
+        assert queue[-1] == {"doc_type": "UNKNOWN", "pages": [1]}
+
+    def test_unknown_pages_respect_batch_size(self):
+        """Fallback UNKNOWN extraction batches must remain bounded."""
+        from src.config import BATCH_SIZE
+        from src.graph import _build_processing_queue
+
+        docs = [
+            {"page_num": i, "source_type": "UNKNOWN"}
+            for i in range(1, BATCH_SIZE + 3)
+        ]
+        queue = _build_processing_queue(docs)
+
+        assert queue[0]["doc_type"] == "UNKNOWN"
+        assert len(queue[0]["pages"]) == BATCH_SIZE
+        assert queue[1]["pages"] == [BATCH_SIZE + 1, BATCH_SIZE + 2]
 
     def test_drug_chart_uses_batch_extractor(self, monkeypatch, empty_state: dict):
         """Drug chart pages should be extracted with one batch call."""
@@ -757,6 +788,8 @@ class TestOllamaBackup:
         """Test that OCR text is cached locally and loaded correctly."""
         import os
         from src.tools import extract_page_text
+
+        os.environ.pop("OCR_CACHE_NAMESPACE", None)
         
         cache_file = "patient2_page_999.txt"
         if os.path.exists(cache_file):
@@ -775,6 +808,16 @@ class TestOllamaBackup:
         finally:
             if os.path.exists(cache_file):
                 os.remove(cache_file)
+
+    def test_ocr_cache_namespace_avoids_legacy_file(self, monkeypatch, tmp_path):
+        """Namespaced cache paths avoid stale patient2_page_N.txt reuse."""
+        from src.tools import get_ocr_cache_file
+
+        monkeypatch.setenv("OCR_CACHE_NAMESPACE", "patient_pdf_hash")
+        monkeypatch.setenv("OCR_CACHE_DIR", str(tmp_path))
+
+        cache_file = get_ocr_cache_file(7)
+        assert cache_file == tmp_path / "patient_pdf_hash" / "page_7.txt"
 
 
 # ─── RUN ─────────────────────────────────────────────────────────────────────────

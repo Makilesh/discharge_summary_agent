@@ -17,7 +17,9 @@ Clinical Safety:
 """
 
 from __future__ import annotations
+import hashlib
 import json
+import os
 from typing import Optional
 
 from langgraph.graph import StateGraph, END
@@ -57,6 +59,8 @@ def initialize_node(state: dict) -> dict:
     start_trace_len = len(state.get("trace", []))
     pdf_path = state.get("_pdf_path", "")
     step = MAX_ITERATIONS - state.get("steps_remaining", MAX_ITERATIONS)
+    cache_namespace = _ocr_cache_namespace(pdf_path)
+    os.environ["OCR_CACHE_NAMESPACE"] = cache_namespace
 
     emit_trace(
         state=state,
@@ -64,7 +68,7 @@ def initialize_node(state: dict) -> dict:
         phase="INITIALIZE",
         reasoning=f"Starting agent. Loading PDF from {pdf_path}",
         action="LOAD_PDF",
-        observation="Beginning page image extraction and classification",
+        observation=f"Beginning page image extraction and classification. OCR cache namespace: {cache_namespace}",
         decision="Extract all page images, then batch-classify",
     )
 
@@ -886,9 +890,24 @@ def hard_cap_escalate_node(state: dict) -> dict:
     )
 
     # Still run cross-reference on whatever we have
+    emit_trace(
+        state=state, step_number=MAX_ITERATIONS, phase="HARD_CAP_ESCALATE",
+        reasoning="Running mandatory cross-reference audit on partial state before hard-cap compilation",
+        action="CROSS_REFERENCE_AUDIT",
+        decision="Execute CR-1 through CR-5 on available extracted data",
+    )
     try:
         new_conflicts, _ = cross_reference_audit(state)
-    except Exception:
+    except Exception as e:
+        emit_trace(
+            state=state, step_number=MAX_ITERATIONS, phase="HARD_CAP_ESCALATE",
+            reasoning="Cross-reference audit failed during hard-cap compilation",
+            action="CROSS_REFERENCE_AUDIT_FAILED",
+            observation=str(e)[:200],
+            decision="Compile with SUMMARY_COMPLETENESS escalation; do not invent conflicts",
+            fallback_taken=True,
+            fallback_reason=str(e)[:200],
+        )
         new_conflicts = []
 
     # Generate hospital course from whatever we have
@@ -1069,13 +1088,16 @@ def _build_processing_queue(loaded_documents: list[dict]) -> list[dict]:
                     "pages": batch,
                 })
 
-    # Add any unclassified pages at the end
+    # Add any unclassified pages at the end. UNKNOWN pages are included so a
+    # later text/OCR pass can re-classify them instead of silently dropping them.
     for doc_type, pages in type_pages.items():
-        if doc_type not in EXTRACTION_PRIORITY_ORDER and doc_type != "UNKNOWN":
-            queue.append({
-                "doc_type": doc_type,
-                "pages": sorted(pages),
-            })
+        if doc_type not in EXTRACTION_PRIORITY_ORDER:
+            sorted_pages = sorted(pages)
+            for i in range(0, len(sorted_pages), BATCH_SIZE):
+                queue.append({
+                    "doc_type": doc_type,
+                    "pages": sorted_pages[i:i + BATCH_SIZE],
+                })
 
     return queue
 
@@ -1087,6 +1109,15 @@ def _summarize_doc_types(loaded_documents: list[dict]) -> str:
         dt = doc.get("source_type", "UNKNOWN")
         type_counts[dt] = type_counts.get(dt, 0) + 1
     return ", ".join(f"{dt}({count})" for dt, count in sorted(type_counts.items()))
+
+
+def _ocr_cache_namespace(pdf_path: str) -> str:
+    """Build a stable cache namespace from the resolved PDF path."""
+    resolved = os.path.abspath(pdf_path or "unknown_pdf")
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+    stem = os.path.splitext(os.path.basename(resolved))[0]
+    safe_stem = "".join(c if c.isalnum() else "_" for c in stem).strip("_") or "pdf"
+    return f"{safe_stem}_{digest}"
 
 
 # ─── BUILD THE GRAPH ─────────────────────────────────────────────────────────────

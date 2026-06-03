@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import re
 import os
+from pathlib import Path
 from typing import Optional, Callable, Any
 
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -32,6 +33,21 @@ from .trace import emit_trace
 # ─── LLM SINGLETON ──────────────────────────────────────────────────────────────
 
 _llm: Optional[ChatGoogleGenerativeAI] = None
+
+
+def get_ocr_cache_file(page_num: int) -> Path:
+    """
+    Return the OCR cache path for a page.
+
+    Runtime agent runs set OCR_CACHE_NAMESPACE from the PDF path so stale text
+    from another record cannot be reused. Unit tests and direct tool calls keep
+    the legacy filename unless a namespace is configured.
+    """
+    namespace = os.getenv("OCR_CACHE_NAMESPACE", "").strip()
+    if namespace:
+        cache_dir = Path(os.getenv("OCR_CACHE_DIR", "output/ocr_cache"))
+        return cache_dir / namespace / f"page_{page_num}.txt"
+    return Path(f"patient2_page_{page_num}.txt")
 
 
 def get_llm() -> ChatGoogleGenerativeAI:
@@ -233,9 +249,9 @@ Return ONLY the JSON array, no other text."""
     print("[CLASSIFY] Running text-based classification via Ollama deepseek-r1:14b...")
     classifications = []
     for page_num, img_b64 in page_images_b64:
-        cache_file = f"patient2_page_{page_num}.txt"
+        cache_file = get_ocr_cache_file(page_num)
         page_text = ""
-        if os.path.exists(cache_file):
+        if cache_file.exists():
             with open(cache_file, "r", encoding="utf-8") as f:
                 page_text = f.read().strip()
                 
@@ -290,8 +306,8 @@ def extract_page_text(image_b64: str, page_num: int) -> dict:
         On failure: {"text": "", "confidence": 0.0, "page_num": page_num}
     """
     # 1. Check if local text cache exists and is populated
-    cache_file = f"patient2_page_{page_num}.txt"
-    if os.path.exists(cache_file):
+    cache_file = get_ocr_cache_file(page_num)
+    if cache_file.exists():
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 text = f.read().strip()
@@ -340,6 +356,7 @@ Where 1.0 = fully legible typed text, 0.5 = partially legible, 0.0 = completely 
 
     # 2. Write response to local text cache file
     try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, "w", encoding="utf-8") as f:
             f.write(f"=== PAGE {page_num} ===\n\n{text}")
         print(f"  ✓ Saved Page {page_num} OCR text to local cache {cache_file}")
