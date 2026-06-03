@@ -111,9 +111,17 @@ def _call_vision_llm(prompt: str, image_b64_list: list[str]) -> str:
             response = llm.invoke([msg])
             return response.content
         except Exception as e:
-            print(f"\n[BACKUP] Gemini call failed: {e}. Falling back to Ollama deepseek-r1:14b...")
+            print(f"\n[BACKUP] Gemini call failed: {e}. Checking local fallback...")
     else:
-        print("\n[BACKUP] Gemini API key is missing or dummy. Falling back to Ollama deepseek-r1:14b...")
+        print("\n[BACKUP] Gemini API key is missing or dummy. Checking local fallback...")
+
+    if image_b64_list:
+        print("[BACKUP] Ollama fallback skipped: configured local model is text-only, not vision-capable.")
+        raise RuntimeError(
+            "Gemini Vision call failed or is unavailable, and the configured "
+            "Ollama fallback is text-only. Refusing to perform image OCR or "
+            "classification with a non-vision model."
+        )
 
     try:
         ollama_llm = ChatOpenAI(

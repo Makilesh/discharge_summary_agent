@@ -305,6 +305,27 @@ def _do_extraction(state: dict, step: int, updates: dict) -> dict:
     new_procedures: list[dict] = []
     new_meds: list[dict] = []
 
+    if not target_pages:
+        emit_trace(
+            state=state, step_number=step, phase="CALL_TOOL",
+            reasoning="Extraction was requested but no target pages were present in state",
+            action="TARGET_PAGES_MISSING",
+            tool_name=f"extract_{doc_type.lower()}",
+            observation=(
+                "No pages were available for extraction. This usually indicates "
+                "a planning-state handoff failure."
+            ),
+            decision="Do not fabricate extracted data; continue to verification",
+            fallback_taken=True,
+            fallback_reason="Missing _target_pages",
+        )
+        updates.setdefault("fabrication_blocks", []).append(
+            f"{doc_type}: extraction skipped because target pages were missing."
+        )
+        updates["loaded_documents"] = []
+        return updates
+
+    page_payloads: list[dict] = []
     for page_num in target_pages:
         img_b64 = page_images.get(page_num)
         if not img_b64:
@@ -329,43 +350,131 @@ def _do_extraction(state: dict, step: int, updates: dict) -> dict:
             updates.setdefault("unreadable_pages", []).append(page_num)
             continue
 
-        # If the page type is UNKNOWN, try to classify it on the fly from text
-        page_doc_type = doc_type
-        if page_doc_type == "UNKNOWN":
-            from .tools import classify_page_from_text
-            page_doc_type = classify_page_from_text(text)
-            print(f"  [RE-CLASSIFY] Page {page_num} text-classified as {page_doc_type}")
+        page_payloads.append({
+            "page_num": page_num,
+            "img_b64": img_b64,
+            "text": text,
+            "confidence": confidence,
+        })
 
-        # Step 2: Extract structured data based on doc type
+    # Drug charts are the highest-value multi-page batch: medication timelines
+    # need cross-page context, and one batch call is cheaper than N page calls.
+    if doc_type == "DRUG_CHART" and page_payloads:
+        page_texts = [(p["page_num"], p["text"]) for p in page_payloads]
+        combined_text = "\n\n".join(text for _, text in page_texts)
+        include_images = "[DRUG NAME PARTIALLY LEGIBLE" in combined_text
+        page_image_inputs = (
+            [(p["page_num"], p["img_b64"]) for p in page_payloads]
+            if include_images else None
+        )
+
         try:
-            extracted = extract_clinical_data(
-                text=text, page_num=page_num,
-                doc_type=page_doc_type, image_b64=img_b64,
+            extracted = extract_drug_chart_batch(
+                page_texts=page_texts,
+                page_images=page_image_inputs,
             )
+            if not isinstance(extracted, dict):
+                extracted = {}
         except Exception as e:
             emit_trace(
                 state=state, step_number=step, phase="CALL_TOOL",
-                reasoning=f"Extraction failed for page {page_num} ({page_doc_type})",
+                reasoning=f"Batch extraction failed for drug chart pages {target_pages}",
                 action="EXTRACTION_FAILED", fallback_taken=True,
                 fallback_reason=str(e)[:200],
             )
             extracted = {}
 
-        # Build document entry
-        doc_entry = {
-            "page_num": page_num,
-            "source_type": page_doc_type,
-            "raw_text": text[:5000],  # Truncate for state size
-            "confidence": confidence,
-            "extracted_data": extracted,
-        }
-        new_docs.append(doc_entry)
+        meds = extracted.get("medications", [])
+        if isinstance(meds, list):
+            source_pages = [p["page_num"] for p in page_payloads]
+            for med in meds:
+                if isinstance(med, dict):
+                    med.setdefault("status", "INPATIENT_ONLY")
+                    med.setdefault("source_pages", source_pages)
+                    new_meds.append(med)
 
-        # Route extracted data to appropriate state fields
-        _route_extracted_data(
-            state, extracted, page_doc_type, page_num, updates,
-            new_lab_results, new_imaging, new_procedures, new_meds,
+        for payload in page_payloads:
+            new_docs.append({
+                "page_num": payload["page_num"],
+                "source_type": doc_type,
+                "raw_text": payload["text"][:5000],
+                "confidence": payload["confidence"],
+                "extracted_data": {
+                    "batch_extraction": True,
+                    "medication_count": len(new_meds),
+                    "chart_date_range": extracted.get("chart_date_range", {}),
+                    "notes": extracted.get("notes"),
+                },
+            })
+
+        emit_trace(
+            state=state, step_number=step, phase="CALL_TOOL",
+            reasoning=(
+                f"Batch processed {len(page_payloads)} drug chart pages to preserve "
+                "cross-page medication context while reducing LLM calls"
+            ),
+            action="BATCH_EXTRACTION_COMPLETE",
+            tool_name="extract_drug_chart_batch",
+            observation=f"Extracted {len(new_meds)} medication entries from pages {target_pages}",
+            decision="Route batched medications to reconciliation state fields",
+            fields_updated=["drug_chart", "inpatient_medications"],
         )
+    else:
+        for payload in page_payloads:
+            page_num = payload["page_num"]
+            img_b64 = payload["img_b64"]
+            text = payload["text"]
+            confidence = payload["confidence"]
+
+            # If the page type is UNKNOWN, try to classify it on the fly from text
+            page_doc_type = doc_type
+            if page_doc_type == "UNKNOWN":
+                from .tools import classify_page_from_text
+                page_doc_type = classify_page_from_text(text)
+                print(f"  [RE-CLASSIFY] Page {page_num} text-classified as {page_doc_type}")
+
+            # Step 2: Extract structured data based on doc type. Prefer text-only
+            # specialized tools where possible; use image context only for pages
+            # that are already ambiguous, to control cost without hiding uncertainty.
+            try:
+                if page_doc_type == "TYPED_DISCHARGE_SUMMARY":
+                    extracted = extract_typed_summary(text=text, page_num=page_num)
+                elif page_doc_type.startswith("LAB_REPORT"):
+                    extracted = extract_lab_report(
+                        text=text, page_num=page_num, report_type=page_doc_type
+                    )
+                else:
+                    image_for_extraction = img_b64 if "[UNCLEAR" in text else None
+                    extracted = extract_clinical_data(
+                        text=text, page_num=page_num,
+                        doc_type=page_doc_type, image_b64=image_for_extraction,
+                    )
+                if not isinstance(extracted, dict):
+                    extracted = {}
+            except Exception as e:
+                emit_trace(
+                    state=state, step_number=step, phase="CALL_TOOL",
+                    reasoning=f"Extraction failed for page {page_num} ({page_doc_type})",
+                    action="EXTRACTION_FAILED", fallback_taken=True,
+                    fallback_reason=str(e)[:200],
+                )
+                extracted = {}
+
+            # Build document entry
+            doc_entry = {
+                "page_num": page_num,
+                "source_type": page_doc_type,
+                "raw_text": text[:5000],  # Truncate for state size
+                "confidence": confidence,
+                "extracted_data": extracted,
+            }
+            new_docs.append(doc_entry)
+
+            # Route extracted data to appropriate state fields
+            _route_extracted_data(
+                state, extracted, page_doc_type, page_num, updates,
+                new_lab_results, new_imaging, new_procedures, new_meds,
+            )
 
     emit_trace(
         state=state, step_number=step, phase="CALL_TOOL",

@@ -76,6 +76,9 @@ class AgentState(TypedDict):
     current_phase: str                  # REASON | PLAN | CALL_TOOL | OBSERVE | VERIFY | COMPILE
     retry_counts: dict                  # {"tool_name": retry_count}
     processing_queue: list[dict]        # Pages grouped by type, in priority order
+    _next_action: str                   # Planned action passed from REASON to CALL_TOOL
+    _target_doc_type: str               # Planned document type for extraction
+    _target_pages: list[int]            # Planned pages for extraction
 
     # ─── EXTRACTED CLINICAL FIELDS ───────────────────────────────────────────
     extracted_demographics: dict
@@ -146,6 +149,9 @@ def create_initial_state() -> dict:
         "current_phase": "INITIALIZE",
         "retry_counts": {},
         "processing_queue": [],
+        "_next_action": "",
+        "_target_doc_type": "",
+        "_target_pages": [],
 
         # Clinical fields
         "extracted_demographics": {},

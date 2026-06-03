@@ -600,10 +600,133 @@ class TestPageHandling:
         assert MIN_TEXT_LENGTH == 30
 
 
+# ─── TEST: Graph Planning Handoff & Batch Extraction ────────────────────────────
+
+class TestGraphExtraction:
+    """Regression tests for REASON → CALL_TOOL planning state."""
+
+    def test_reason_targets_survive_into_call_tool(self, monkeypatch):
+        """
+        LangGraph must preserve the planned document type and pages; otherwise
+        CALL_TOOL silently extracts zero pages.
+        """
+        from src.graph import build_agent_graph
+
+        monkeypatch.setattr(
+            "src.graph.extract_all_page_images",
+            lambda pdf_path: {1: b"fake-png"},
+        )
+        monkeypatch.setattr(
+            "src.graph.classify_document_pages",
+            lambda page_images: [
+                {"page_num": 1, "doc_type": "TYPED_DISCHARGE_SUMMARY", "confidence": 0.9}
+            ],
+        )
+        monkeypatch.setattr(
+            "src.graph.extract_page_text",
+            lambda img_b64, page_num: {
+                "text": "Typed discharge summary text longer than thirty characters.",
+                "confidence": 1.0,
+                "page_num": page_num,
+            },
+        )
+        monkeypatch.setattr(
+            "src.graph.extract_typed_summary",
+            lambda text, page_num: {
+                "demographics": {"name": "TEST PATIENT"},
+                "admission_date": "01/01/2024",
+                "discharge_date": "02/01/2024",
+                "diagnoses": {"principal": ["Test"], "secondary": [], "provisional": [], "final": ["Test"]},
+                "follow_up": ["Review"],
+                "condition_at_discharge": "Stable",
+                "allergies": ["NOT KNOWN"],
+            },
+        )
+
+        state = create_initial_state()
+        state["_pdf_path"] = "dummy.pdf"
+        agent = build_agent_graph()
+
+        call_tool_output = None
+        for event in agent.stream(state, {"recursion_limit": 10}):
+            if "call_tool" in event:
+                call_tool_output = event["call_tool"]
+                break
+
+        assert call_tool_output is not None
+        assert call_tool_output["loaded_documents"][0]["page_num"] == 1
+        assert call_tool_output["loaded_documents"][0]["source_type"] == "TYPED_DISCHARGE_SUMMARY"
+        assert call_tool_output["extracted_demographics"]["name"] == "TEST PATIENT"
+
+    def test_drug_chart_uses_batch_extractor(self, monkeypatch, empty_state: dict):
+        """Drug chart pages should be extracted with one batch call."""
+        import src.graph as graph
+
+        calls = []
+
+        def fake_batch(page_texts, page_images=None):
+            calls.append((page_texts, page_images))
+            return {
+                "medications": [
+                    {
+                        "name": "INJ MEROPENEM",
+                        "dose": "1g",
+                        "route": "IV",
+                        "frequency": "TID",
+                        "status": "INPATIENT_ONLY",
+                        "change_reason": None,
+                        "change_reason_documented": False,
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(
+            graph,
+            "extract_page_text",
+            lambda img_b64, page_num: {
+                "text": f"Drug chart page {page_num} with medication rows clearly visible.",
+                "confidence": 0.9,
+                "page_num": page_num,
+            },
+        )
+        monkeypatch.setattr(graph, "extract_drug_chart_batch", fake_batch)
+
+        empty_state.update({
+            "_target_doc_type": "DRUG_CHART",
+            "_target_pages": [42, 43, 44],
+            "page_images": {42: "img42", 43: "img43", 44: "img44"},
+        })
+
+        updates = graph._do_extraction(
+            empty_state,
+            step=1,
+            updates={"steps_remaining": 10, "current_phase": "OBSERVE"},
+        )
+
+        assert len(calls) == 1
+        assert [page for page, _ in calls[0][0]] == [42, 43, 44]
+        assert updates["inpatient_medications"][0]["name"] == "INJ MEROPENEM"
+
+
 # ─── TEST: Ollama Backup & OCR Caching ──────────────────────────────────────────
 
 class TestOllamaBackup:
     """Tests for Ollama backup and OCR text caching."""
+
+    def test_text_only_backup_refuses_image_input(self, monkeypatch):
+        """A non-vision fallback must not hallucinate OCR for image inputs."""
+        import src.tools as tools
+
+        class FailingGemini:
+            def invoke(self, messages):
+                raise RuntimeError("quota exhausted")
+
+        monkeypatch.setattr(tools, "GOOGLE_API_KEY", "real-looking-key")
+        monkeypatch.setattr(tools, "_llm", None)
+        monkeypatch.setattr(tools, "get_llm", lambda: FailingGemini())
+
+        with pytest.raises(RuntimeError, match="text-only"):
+            tools._call_vision_llm("classify this page", ["fake-image-b64"])
 
     def test_classify_page_from_text_fallback(self):
         """Test classifying a page from its text using Ollama."""
