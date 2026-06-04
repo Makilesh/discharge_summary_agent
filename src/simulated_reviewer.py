@@ -117,6 +117,10 @@ def _apply_rev001_conflict_disambiguation(text: str) -> tuple[str, bool]:
     if "[CONFLICT" not in text:
         return text, False
 
+    # Idempotency: skip if disambiguation table already inserted
+    if "Diagnosis Disambiguation Table:" in text:
+        return text, False
+
     # Find the principal diagnosis section
     conflict_pattern = r'(\[CONFLICT[^\]]*\])'
     match = re.search(conflict_pattern, text)
@@ -318,6 +322,9 @@ def _apply_rev005_citation_check(text: str) -> tuple[str, bool]:
     has_citation = bool(re.search(r'\[Page\s+\d+\]', section_content))
 
     if not has_citation:
+        # Idempotency: skip if warning already present
+        if "SOURCE CITATION MISSING" in section_content:
+            return text, False
         warning = "\n\n⚠️ SOURCE CITATION MISSING — Hospital course sentences lack [Page N] references."
         text = text[:next_section] + warning + "\n" + text[next_section:]
         return text, True
@@ -486,17 +493,37 @@ def _run_llm_correction_pass(
         is_dummy_key = not GOOGLE_API_KEY or "your-google-api-key" in GOOGLE_API_KEY
 
         if not is_dummy_key:
-            llm = ChatGoogleGenerativeAI(
-                model=LLM_MODEL,
-                google_api_key=GOOGLE_API_KEY,
-                temperature=0.0,
-                max_output_tokens=4096,
-            )
-            msg = HumanMessage(content=prompt)
-            response = llm.invoke([msg])
-            response_text = response.content
+            try:
+                llm = ChatGoogleGenerativeAI(
+                    model=LLM_MODEL,
+                    google_api_key=GOOGLE_API_KEY,
+                    temperature=0.0,
+                    max_output_tokens=4096,
+                )
+                msg = HumanMessage(content=prompt)
+                response = llm.invoke([msg])
+                response_text = response.content
+            except Exception as gemini_err:
+                # Fallback to Ollama on Gemini failure (e.g. rate limit)
+                print(f"[REVIEWER] Gemini failed ({type(gemini_err).__name__}), falling back to Ollama...")
+                try:
+                    from langchain_openai import ChatOpenAI
+                    ollama_llm = ChatOpenAI(
+                        model="deepseek-r1:14b",
+                        openai_api_key="ollama",
+                        base_url="http://localhost:11434/v1",
+                        temperature=0.0,
+                    )
+                    msg = HumanMessage(content=prompt)
+                    response = ollama_llm.invoke([msg])
+                    response_text = response.content
+                    response_text = re.sub(r'<think>[\s\S]*?</think>', '', response_text)
+                    response_text = re.sub(r'<thought>[\s\S]*?</thought>', '', response_text)
+                except Exception as ollama_err:
+                    print(f"[REVIEWER] Ollama fallback also failed: {ollama_err}")
+                    return accepted_corrections, fabrication_blocks
         else:
-            # Fallback to Ollama
+            # No Gemini key — use Ollama directly
             from langchain_openai import ChatOpenAI
             ollama_llm = ChatOpenAI(
                 model="deepseek-r1:14b",
@@ -507,7 +534,6 @@ def _run_llm_correction_pass(
             msg = HumanMessage(content=prompt)
             response = ollama_llm.invoke([msg])
             response_text = response.content
-            # Strip thinking tags
             response_text = re.sub(r'<think>[\s\S]*?</think>', '', response_text)
             response_text = re.sub(r'<thought>[\s\S]*?</thought>', '', response_text)
 
