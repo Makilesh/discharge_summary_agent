@@ -415,19 +415,30 @@ def check_cr3_lab_evidence(state: dict) -> list[dict]:
         if value is None:
             continue
 
+        # Normalize WBC/cell count units: if value is in raw Cells/cumm (e.g., 7160)
+        # but threshold expects x10^3/uL, divide by 1000 for correct comparison.
+        unit = (result.get("unit") or "").lower()
+        comparison_value = value
+        if any(kw in test for kw in ("wbc", "total count", "total wbc")) and value > 100:
+            if any(u in unit for u in ("cells", "cumm", "cmm", "/ul")):
+                comparison_value = value / 1000.0
+
         # Check against critical thresholds
         for threshold_key, thresholds in CRITICAL_LAB_THRESHOLDS.items():
-            if threshold_key in test:
+            # Use word-boundary matching to avoid false positives.
+            # e.g. threshold_key="ph" must NOT match "neutrophils" or "lymphocytes".
+            # It SHOULD match: "ph", "urine ph", "blood ph", "arterial ph".
+            if re.search(rf'(?<![a-z]){re.escape(threshold_key)}(?![a-z])', test):
                 is_critical = False
                 reason_parts = []
 
-                if "low" in thresholds and value < thresholds["low"]:
+                if "low" in thresholds and comparison_value < thresholds["low"]:
                     is_critical = True
                     reason_parts.append(
                         f"{test}: {value} {thresholds.get('unit', '')} is critically LOW "
                         f"(threshold: {thresholds['low']})"
                     )
-                if "high" in thresholds and value > thresholds["high"]:
+                if "high" in thresholds and comparison_value > thresholds["high"]:
                     is_critical = True
                     reason_parts.append(
                         f"{test}: {value} {thresholds.get('unit', '')} is critically HIGH "
