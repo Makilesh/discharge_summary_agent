@@ -282,9 +282,9 @@ class LearningOrchestrator:
             except Exception as e:
                 print(f"  Iteration {i:2d} | ERROR: {e}")
 
-            # Rate limit delay — respect Free Tier RPM constraints
+            # Rate limit delay — reduced since we cascade across 4 models (45 RPM effective)
             if i < self.n_train:
-                time.sleep(4)
+                time.sleep(1)
 
         return self.training_records
 
