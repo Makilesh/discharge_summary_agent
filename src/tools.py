@@ -27,14 +27,16 @@ from .config import (
     GOOGLE_API_KEY, LLM_MODEL, LLM_TEMPERATURE,
     LLM_BACKEND, OLLAMA_BASE_URL, REASONING_BACKUP_MODEL, VISION_BACKUP_MODEL,
     DOC_TYPES, MAX_RETRIES, MIN_TEXT_LENGTH,
+    MODEL_MAPPING, MODEL_FALLBACK_CHAIN, MODEL_RPM,
+    MODEL_LITE, MODEL_PRIMARY, MODEL_FALLBACK, MODEL_PREVIEW,
 )
 from .trace import emit_trace
 
 
-# ─── LLM SINGLETON ──────────────────────────────────────────────────────────────
+# ─── MULTI-MODEL LLM CACHE ──────────────────────────────────────────────────────
 
-_llm: Optional[ChatGoogleGenerativeAI] = None
-_llm_model_name: Optional[str] = None
+_llm_cache: dict[str, ChatGoogleGenerativeAI] = {}
+_last_call_time: dict[str, float] = {}  # model_name → epoch of last call
 
 
 def _env(name: str, default: str) -> str:
@@ -90,19 +92,52 @@ def get_extraction_cache_file(page_num: int, doc_type: str) -> Path:
     return Path(f"extracted_{page_num}_{doc_type}.json")
 
 
-def get_llm() -> ChatGoogleGenerativeAI:
-    """Get or create the Gemini Vision LLM instance."""
-    global _llm, _llm_model_name
-    model_name = get_gemini_model_name()
-    if _llm is None or _llm_model_name != model_name:
-        _llm = ChatGoogleGenerativeAI(
+def get_llm_for_model(model_name: str) -> ChatGoogleGenerativeAI:
+    """
+    Get or create a cached ChatGoogleGenerativeAI instance for the given model.
+
+    Each distinct model name gets its own singleton instance so we can route
+    different task types to different Gemini models without re-creating objects.
+    """
+    global _llm_cache
+    if model_name not in _llm_cache:
+        _llm_cache[model_name] = ChatGoogleGenerativeAI(
             model=model_name,
             google_api_key=_env("GOOGLE_API_KEY", GOOGLE_API_KEY),
             temperature=LLM_TEMPERATURE,
             max_output_tokens=8192,
         )
-        _llm_model_name = model_name
-    return _llm
+        print(f"  [MODEL] Initialized Gemini model instance: {model_name}")
+    return _llm_cache[model_name]
+
+
+def get_llm() -> ChatGoogleGenerativeAI:
+    """Get or create the default Gemini Vision LLM instance (backward compat)."""
+    return get_llm_for_model(get_gemini_model_name())
+
+
+def _resolve_model_for_task(task_type: Optional[str] = None) -> str:
+    """Resolve which Gemini model to use for a given task type."""
+    if task_type and task_type in MODEL_MAPPING:
+        return MODEL_MAPPING[task_type]
+    return get_gemini_model_name()
+
+
+def _rpm_sleep(model_name: str) -> None:
+    """
+    Enforce minimum inter-request delay based on model RPM limits.
+    Prevents bursting past the per-minute quota.
+    """
+    import time
+    rpm = MODEL_RPM.get(model_name, 10)
+    min_interval = 60.0 / rpm + 0.5  # Add 0.5s safety margin
+    last = _last_call_time.get(model_name, 0.0)
+    elapsed = time.time() - last
+    if elapsed < min_interval:
+        sleep_time = min_interval - elapsed
+        print(f"  [RATE] Sleeping {sleep_time:.1f}s for {model_name} (RPM={rpm})")
+        time.sleep(sleep_time)
+    _last_call_time[model_name] = time.time()
 
 
 def _call_ollama_text(prompt: str, model: Optional[str] = None) -> str:
@@ -141,7 +176,8 @@ def _call_ollama_vision(prompt: str, image_b64_list: list[str]) -> str:
 
 def classify_page_from_text(text: str) -> str:
     """
-    Classify page type from its OCR text using Ollama deepseek-r1:14b.
+    Classify page type from its OCR text using Gemini (gemini-3.1-flash-lite).
+    Falls back to local Ollama if Gemini is unavailable.
     
     Clinical Safety:
         Returns UNKNOWN if classification fails or is not in taxonomy.
@@ -159,7 +195,7 @@ Rules:
 - If it doesn't fit any type, return "UNKNOWN"."""
     
     try:
-        content = _call_ollama_text(prompt)
+        content = _call_vision_llm(prompt, [], task_type="CLASSIFICATION")
         cleaned_type = content.strip().upper()
         # Find matches in DOC_TYPES
         for dt in DOC_TYPES:
@@ -167,7 +203,15 @@ Rules:
                 return dt
         return "UNKNOWN"
     except Exception as e:
-        print(f"[CLASSIFY] Warning: Failed to classify page from text: {e}")
+        print(f"[CLASSIFY] Warning: Gemini classification failed ({e}). Trying local...")
+        try:
+            content = _call_ollama_text(prompt)
+            cleaned_type = content.strip().upper()
+            for dt in DOC_TYPES:
+                if dt in cleaned_type:
+                    return dt
+        except Exception:
+            pass
         return "UNKNOWN"
 
 
@@ -213,40 +257,92 @@ def _read_cached_ocr_text(page_num: int) -> str:
     return text.replace(f"=== PAGE {page_num} ===", "").strip()
 
 
-def _call_vision_llm(prompt: str, image_b64_list: list[str], force_local: bool = False) -> str:
+def _call_vision_llm(
+    prompt: str,
+    image_b64_list: list[str],
+    task_type: Optional[str] = None,
+    force_local: bool = False,
+) -> str:
     """
     Call Gemini Vision with text prompt and one or more page images.
     
-    Returns the raw text response from the configured LLM backend.
-    Uses Gemini, Ollama text reasoning, or Ollama vision depending on backend and inputs.
+    Dynamically selects the correct Gemini model based on task_type using
+    MODEL_MAPPING from config. Implements automatic rate-limit (HTTP 429)
+    backoff with model fallback chain before resorting to local Ollama.
+
+    Args:
+        prompt: The text prompt.
+        image_b64_list: List of base64-encoded page images.
+        task_type: Document type or task name (e.g. "OCR", "DRUG_CHART").
+            Used to look up the target model in MODEL_MAPPING.
+        force_local: If True, skip Gemini entirely and use Ollama.
+    
+    Returns the raw text response from the selected LLM backend.
     """
+    import time
+
     backend = "local" if force_local else get_backend()
     google_api_key = _env("GOOGLE_API_KEY", GOOGLE_API_KEY)
     is_dummy_key = not google_api_key or "your-google-api-key" in google_api_key
     
     if backend in {"auto", "gemini"} and not is_dummy_key:
-        try:
-            llm = get_llm()
-            content: list[dict] = [{"type": "text", "text": prompt}]
-            for img_b64 in image_b64_list:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-                })
-            msg = HumanMessage(content=content)
-            import time
-            time.sleep(4.5)
-            response = llm.invoke([msg])
-            return response.content
-        except Exception as e:
-            print(f"\n[BACKUP] Gemini call failed: {e}. Checking local fallback...")
-            if backend == "gemini":
-                raise
+        # Resolve the primary model for this task type
+        primary_model = _resolve_model_for_task(task_type)
+        # Build the attempt order: primary → fallback chain
+        models_to_try = [primary_model] + MODEL_FALLBACK_CHAIN.get(primary_model, [])
+        # Deduplicate while preserving order
+        seen = set()
+        attempt_order = []
+        for m in models_to_try:
+            if m not in seen:
+                seen.add(m)
+                attempt_order.append(m)
+
+        last_error = None
+        for model_name in attempt_order:
+            try:
+                llm = get_llm_for_model(model_name)
+                content: list[dict] = [{"type": "text", "text": prompt}]
+                for img_b64 in image_b64_list:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                    })
+                msg = HumanMessage(content=content)
+
+                # RPM-aware throttle
+                _rpm_sleep(model_name)
+
+                task_label = f" [{task_type}]" if task_type else ""
+                print(f"  [API] {model_name}{task_label} ...")
+                response = llm.invoke([msg])
+                return response.content
+
+            except Exception as e:
+                error_str = str(e).lower()
+                is_rate_limit = "429" in error_str or "resource_exhausted" in error_str or "rate" in error_str
+                last_error = e
+
+                if is_rate_limit:
+                    print(f"  [RATE] {model_name} rate-limited (429). Trying next model...")
+                    # Brief backoff before trying next model
+                    time.sleep(2.0)
+                    continue
+                else:
+                    print(f"  [ERROR] {model_name} failed: {str(e)[:150]}. Trying next model...")
+                    continue
+
+        # All Gemini models exhausted
+        print(f"\n[BACKUP] All Gemini models exhausted. Last error: {last_error}")
+        if backend == "gemini":
+            raise last_error or RuntimeError("All Gemini models failed")
+
     elif backend == "gemini":
         raise RuntimeError("LLM_BACKEND=gemini but GOOGLE_API_KEY is missing or dummy.")
-    elif backend == "auto":
+    elif backend == "auto" and is_dummy_key:
         print("\n[BACKUP] Gemini API key is missing or dummy. Checking local fallback...")
 
+    # Local Ollama fallback
     try:
         if image_b64_list:
             print(f"[BACKUP] Using local vision model {get_vision_model_name()} via Ollama.")
@@ -511,7 +607,7 @@ EXTRACTION_CONFIDENCE: <0.0-1.0>
 
 Where 1.0 = fully legible typed text, 0.5 = partially legible, 0.0 = completely illegible."""
 
-    response = _call_ollama_vision(prompt, [image_b64])
+    response = _call_vision_llm(prompt, [image_b64], task_type="OCR")
 
     # Parse confidence from response
     confidence = 0.5  # Default
@@ -620,7 +716,7 @@ SOURCE TEXT:
 
 Return ONLY the JSON object."""
 
-    response = _call_vision_llm(prompt, [])
+    response = _call_vision_llm(prompt, [], task_type="TYPED_DISCHARGE_SUMMARY")
     result = _parse_json_response(response)
     if result:
         try:
@@ -680,14 +776,13 @@ Return a JSON object with the extracted data. Use null for fields not found.
 Do NOT invent or infer any clinical facts not explicitly present in the text.
 If text is partially legible, use [UNCLEAR: best_guess] annotations."""
 
-    local_only_types = {
-        "NURSING_NOTES", "NURSING_ASSESSMENT", "INTAKE_OUTPUT_CHART",
-        "PROCEDURE_CHART", "BED_SORES_CHART", "CAUTI_CHART",
-        "INVESTIGATION_CHECKLIST", "DISCHARGE_CHECKLIST"
-    }
-    force_local = doc_type in local_only_types
+    # Route through MODEL_MAPPING — no more forced local processing.
+    # The model mapping in config.py sends simple doc types to gemini-3.1-flash-lite
+    # and complex ones to gemini-3.5-flash. Local Ollama is only used as a backup
+    # when ALL Gemini models are rate-limited or the API key is missing.
+    force_local = (get_backend() == "local")
     images = [image_b64] if image_b64 else []
-    response = _call_vision_llm(prompt, images, force_local=force_local)
+    response = _call_vision_llm(prompt, images, task_type=doc_type, force_local=force_local)
     result = _parse_json_response(response)
     if isinstance(result, dict):
         result["source_page"] = page_num
@@ -895,7 +990,7 @@ SOURCE TEXT:
 
 Return ONLY the JSON object."""
 
-    response = _call_vision_llm(prompt, [])
+    response = _call_vision_llm(prompt, [], task_type=report_type)
     result = _parse_json_response(response)
     if result:
         try:
@@ -964,7 +1059,7 @@ SOURCE TEXT:
 Return ONLY the JSON object."""
 
     images = [img for _, img in (page_images or [])]
-    response = _call_vision_llm(prompt, images)
+    response = _call_vision_llm(prompt, images, task_type="DRUG_CHART")
     result = _parse_json_response(response)
     if result:
         try:

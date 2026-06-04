@@ -9,7 +9,7 @@ The graph uses LangGraph's StateGraph with conditional edges for routing.
 Each node is a separate function that takes and returns AgentState.
 
 Clinical Safety:
-    - Hard cap of MAX_ITERATIONS = 20 per patient document set.
+    - Hard cap of MAX_ITERATIONS = 25 per patient document set.
     - steps_remaining is decremented on every transition.
     - On cap breach: HARD_CAP_ESCALATE compiles with [MISSING] markers.
     - Never retries a failed tool call more than 2 times.
@@ -997,7 +997,7 @@ def hard_cap_escalate_node(state: dict) -> dict:
     compile_state["escalation_flags"] = state.get("escalation_flags", []) + [{
         "field": "SUMMARY_COMPLETENESS",
         "severity": "CRITICAL",
-        "reason": "Agent step cap (20) reached. Some document types may not have been processed.",
+        "reason": f"Agent step cap ({MAX_ITERATIONS}) reached. Some document types may not have been processed.",
         "source_page": None,
         "requires_clinician": True,
     }]
