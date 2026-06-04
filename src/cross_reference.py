@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Literal, Optional, Any
 import re
 
-from .config import CRITICAL_LAB_THRESHOLDS, CONFLICT_FIELD_TEMPLATE
+from .config import CRITICAL_LAB_THRESHOLDS, CONFLICT_FIELD_TEMPLATE, NON_LAB_PENDING_KEYWORDS
 
 
 # ─── ESCALATE TO CLINICIAN ──────────────────────────────────────────────────────
@@ -429,6 +429,11 @@ def check_cr3_lab_evidence(state: dict) -> list[dict]:
             # e.g. threshold_key="ph" must NOT match "neutrophils" or "lymphocytes".
             # It SHOULD match: "ph", "urine ph", "blood ph", "arterial ph".
             if re.search(rf'(?<![a-z]){re.escape(threshold_key)}(?![a-z])', test):
+                # Check exclusion patterns — e.g., skip "urine ph" for blood pH thresholds.
+                exclude_prefixes = thresholds.get("exclude", [])
+                if any(excl in test for excl in exclude_prefixes):
+                    continue
+
                 is_critical = False
                 reason_parts = []
 
@@ -513,9 +518,16 @@ def check_cr3_lab_evidence(state: dict) -> list[dict]:
                     source_pages=[],
                 )
 
-    # Check for pending results
+    # Check for pending results — filter out non-lab items (devices, procedures)
     pending = state.get("pending_results", [])
     for item in pending:
+        item_lower = (item or "").lower()
+        # Skip non-lab items: IV cannula, catheter, drain, etc.
+        if any(kw in item_lower for kw in NON_LAB_PENDING_KEYWORDS):
+            continue
+        # Skip blank entries
+        if not item_lower.strip():
+            continue
         conflict = {
             "type": "PENDING_RESULT_AT_DISCHARGE",
             "sources": [item],
