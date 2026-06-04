@@ -20,11 +20,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import os
 import re
 import uuid
 from typing import Optional
 
 from .config import GOOGLE_API_KEY, LLM_MODEL
+
+# Reviewer uses its own model to avoid sharing rate limits with Part 1.
+# gemini-3.1-flash-lite has 15 RPM (Free Tier) — highest throughput available.
+REVIEWER_MODEL = os.getenv("REVIEWER_MODEL", "gemini-3.1-flash-lite")
 
 
 # ─── REVIEWER SYSTEM PROMPT (VERSION-CONTROLLED) ────────────────────────────────
@@ -492,50 +497,56 @@ def _run_llm_correction_pass(
 
         is_dummy_key = not GOOGLE_API_KEY or "your-google-api-key" in GOOGLE_API_KEY
 
+        # Cascading model fallback — each Free Tier model has independent
+        # rate limits on the same API key, maximizing effective throughput.
+        # Order: highest RPM first, then by RPD.
+        GEMINI_CASCADE = [
+            "gemini-3.1-flash-lite",   # 15 RPM, 1000 RPD
+            "gemini-3.5-flash",        # 10 RPM, 1500 RPD
+            "gemini-3-flash-preview",  # 10 RPM, 1500 RPD
+            "gemini-2.5-flash",        # 10 RPM, 250 RPD
+        ]
+
+        response_text = None
+
         if not is_dummy_key:
-            try:
-                llm = ChatGoogleGenerativeAI(
-                    model=LLM_MODEL,
-                    google_api_key=GOOGLE_API_KEY,
-                    temperature=0.0,
-                    max_output_tokens=4096,
-                )
-                msg = HumanMessage(content=prompt)
-                response = llm.invoke([msg])
-                response_text = response.content
-            except Exception as gemini_err:
-                # Fallback to Ollama on Gemini failure (e.g. rate limit)
-                print(f"[REVIEWER] Gemini failed ({type(gemini_err).__name__}), falling back to Ollama...")
+            for model_name in GEMINI_CASCADE:
                 try:
-                    from langchain_openai import ChatOpenAI
-                    ollama_llm = ChatOpenAI(
-                        model="deepseek-r1:14b",
-                        openai_api_key="ollama",
-                        base_url="http://localhost:11434/v1",
+                    llm = ChatGoogleGenerativeAI(
+                        model=model_name,
+                        google_api_key=GOOGLE_API_KEY,
                         temperature=0.0,
+                        max_output_tokens=4096,
                     )
                     msg = HumanMessage(content=prompt)
-                    response = ollama_llm.invoke([msg])
+                    response = llm.invoke([msg])
                     response_text = response.content
-                    response_text = re.sub(r'<think>[\s\S]*?</think>', '', response_text)
-                    response_text = re.sub(r'<thought>[\s\S]*?</thought>', '', response_text)
-                except Exception as ollama_err:
-                    print(f"[REVIEWER] Ollama fallback also failed: {ollama_err}")
-                    return accepted_corrections, fabrication_blocks
-        else:
-            # No Gemini key — use Ollama directly
-            from langchain_openai import ChatOpenAI
-            ollama_llm = ChatOpenAI(
-                model="deepseek-r1:14b",
-                openai_api_key="ollama",
-                base_url="http://localhost:11434/v1",
-                temperature=0.0,
-            )
-            msg = HumanMessage(content=prompt)
-            response = ollama_llm.invoke([msg])
-            response_text = response.content
-            response_text = re.sub(r'<think>[\s\S]*?</think>', '', response_text)
-            response_text = re.sub(r'<thought>[\s\S]*?</thought>', '', response_text)
+                    print(f"[REVIEWER] LLM call succeeded with {model_name}")
+                    break  # Success — stop cascading
+                except Exception as e:
+                    print(f"[REVIEWER] {model_name} failed ({type(e).__name__}), trying next...")
+                    continue
+
+        # Final fallback: Ollama (local deepseek-r1:14b)
+        if response_text is None:
+            fallback_reason = "no API key" if is_dummy_key else "all Gemini models rate-limited"
+            print(f"[REVIEWER] Falling back to Ollama ({fallback_reason})...")
+            try:
+                from langchain_openai import ChatOpenAI
+                ollama_llm = ChatOpenAI(
+                    model="deepseek-r1:14b",
+                    openai_api_key="ollama",
+                    base_url="http://localhost:11434/v1",
+                    temperature=0.0,
+                )
+                msg = HumanMessage(content=prompt)
+                response = ollama_llm.invoke([msg])
+                response_text = response.content
+                response_text = re.sub(r'<think>[\s\S]*?</think>', '', response_text)
+                response_text = re.sub(r'<thought>[\s\S]*?</thought>', '', response_text)
+            except Exception as ollama_err:
+                print(f"[REVIEWER] Ollama fallback also failed: {ollama_err}")
+                return accepted_corrections, fabrication_blocks
 
         # Parse JSON response
         response_text = response_text.strip()
