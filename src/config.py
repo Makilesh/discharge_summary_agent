@@ -31,7 +31,7 @@ VISION_BACKUP_MODEL: str = os.getenv("VISION_BACKUP_MODEL", "qwen2.5vl:7b")
 
 # ─── AGENT CONTROL ───────────────────────────────────────────────────────────────
 
-MAX_ITERATIONS: int = 20       # Hard cap on agent steps per patient document set
+MAX_ITERATIONS: int = 25       # Hard cap on agent steps per patient document set
 MAX_RETRIES: int = 2           # Max retries per failed tool call before marking [UNRESOLVED]
 MIN_TEXT_LENGTH: int = 30      # Pages with OCR text below this are considered unreadable
 BATCH_SIZE: int = 15           # Max pages to batch-process in a single tool call
