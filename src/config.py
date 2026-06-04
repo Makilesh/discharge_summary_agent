@@ -20,7 +20,7 @@ load_dotenv()
 # ─── LLM CONFIGURATION ──────────────────────────────────────────────────────────
 
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
-LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-2.0-flash")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-3.5-flash")
 LLM_TEMPERATURE: float = 0.0  # Deterministic for clinical safety — no creative sampling
 LLM_BACKEND: str = os.getenv("LLM_BACKEND", "auto").lower()
 # LLM_BACKEND: "auto" tries Gemini first, then local Ollama. "gemini" disables local
@@ -28,6 +28,83 @@ LLM_BACKEND: str = os.getenv("LLM_BACKEND", "auto").lower()
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 REASONING_BACKUP_MODEL: str = os.getenv("REASONING_BACKUP_MODEL", "deepseek-r1:14b")
 VISION_BACKUP_MODEL: str = os.getenv("VISION_BACKUP_MODEL", "qwen2.5vl:7b")
+
+# ─── MULTI-MODEL ROUTING (Free Tier) ────────────────────────────────────────────
+# Distribute API calls across multiple Gemini models to maximise total throughput.
+# Each model has independent RPM/RPD quotas on the Free Tier.
+#
+# Strategy:
+#   - LITE model (gemini-3.1-flash-lite): highest RPM (15) — bulk OCR, classification,
+#     simple document types (nursing notes, vitals, checklists).
+#   - PRIMARY model (gemini-3.5-flash): best quality (10 RPM, 1500 RPD) — complex
+#     clinical reasoning, lab/drug/imaging extraction, compilation.
+#   - FALLBACK model (gemini-2.5-flash): overflow when primary is rate-limited
+#     (10 RPM, 250 RPD) — same capabilities, lower daily budget.
+#   - PREVIEW model (gemini-3-flash-preview): backup equal to PRIMARY (10 RPM, 1500 RPD).
+
+MODEL_LITE: str = "gemini-3.1-flash-lite"
+MODEL_PRIMARY: str = "gemini-3.5-flash"
+MODEL_FALLBACK: str = "gemini-2.5-flash"
+MODEL_PREVIEW: str = "gemini-3-flash-preview"
+
+# Rate limits per model (Free Tier)
+MODEL_RPM: dict[str, int] = {
+    MODEL_LITE: 15,
+    MODEL_PRIMARY: 10,
+    MODEL_FALLBACK: 10,
+    MODEL_PREVIEW: 10,
+}
+
+MODEL_RPD: dict[str, int] = {
+    MODEL_LITE: 1000,
+    MODEL_PRIMARY: 1500,
+    MODEL_FALLBACK: 250,
+    MODEL_PREVIEW: 1500,
+}
+
+# Task-type → model mapping. Keys are document types from DOC_TYPES + special task names.
+MODEL_MAPPING: dict[str, str] = {
+    # --- High-frequency / low-complexity → LITE (15 RPM) ---
+    "OCR": MODEL_LITE,
+    "CLASSIFICATION": MODEL_LITE,
+    "NURSING_NOTES": MODEL_LITE,
+    "NURSING_ASSESSMENT": MODEL_LITE,
+    "BED_SORES_CHART": MODEL_LITE,
+    "CAUTI_CHART": MODEL_LITE,
+    "INVESTIGATION_CHECKLIST": MODEL_LITE,
+    "DISCHARGE_CHECKLIST": MODEL_LITE,
+    "MONITORING_CHART_VITALS": MODEL_LITE,
+    "MONITORING_CHART_DIABETES": MODEL_LITE,
+    "INTAKE_OUTPUT_CHART": MODEL_LITE,
+    # --- Medium/high complexity → PRIMARY (10 RPM, 1500 RPD) ---
+    "ADMISSION_RECORD": MODEL_PRIMARY,
+    "ER_OBSERVATION_CHART": MODEL_PRIMARY,
+    "ICU_CHART": MODEL_PRIMARY,
+    "CONSULTATION_SHEET": MODEL_PRIMARY,
+    "PROCEDURE_CHART": MODEL_PRIMARY,
+    "LAB_REPORT_BIOCHEMISTRY": MODEL_PRIMARY,
+    "LAB_REPORT_HAEMATOLOGY": MODEL_PRIMARY,
+    "LAB_REPORT_URINE": MODEL_PRIMARY,
+    "LAB_REPORT_ABG": MODEL_PRIMARY,
+    "LAB_REPORT_CULTURE": MODEL_PRIMARY,
+    "IMAGING_REPORT_USG": MODEL_PRIMARY,
+    "IMAGING_REPORT_CT": MODEL_PRIMARY,
+    "ECHO_REPORT": MODEL_PRIMARY,
+    "DRUG_CHART": MODEL_PRIMARY,
+    "TYPED_DISCHARGE_SUMMARY": MODEL_PRIMARY,
+    # --- Reasoning-heavy → PRIMARY ---
+    "RECONCILIATION": MODEL_PRIMARY,
+    "COMPILATION": MODEL_PRIMARY,
+    "HOSPITAL_COURSE": MODEL_PRIMARY,
+}
+
+# Fallback chain: when a model is rate-limited, try the next model in order.
+MODEL_FALLBACK_CHAIN: dict[str, list[str]] = {
+    MODEL_LITE: [MODEL_FALLBACK, MODEL_PRIMARY],
+    MODEL_PRIMARY: [MODEL_PREVIEW, MODEL_FALLBACK],
+    MODEL_FALLBACK: [MODEL_PRIMARY, MODEL_PREVIEW],
+    MODEL_PREVIEW: [MODEL_PRIMARY, MODEL_FALLBACK],
+}
 
 # ─── AGENT CONTROL ───────────────────────────────────────────────────────────────
 
