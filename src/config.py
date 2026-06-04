@@ -220,10 +220,18 @@ CRITICAL_LAB_THRESHOLDS: dict = {
     "potassium": {"low": 2.5, "high": 6.5, "unit": "mmol/L"},
     "glucose": {"low": 50, "high": 400, "unit": "mg/dL"},
     "creatinine": {"high": 5.0, "unit": "mg/dL"},
-    "ph": {"low": 7.25, "high": 7.55, "unit": ""},
+    # Blood/arterial pH only — urine pH (normal 4.5–8.0) must NOT trigger these.
+    "ph": {"low": 7.25, "high": 7.55, "unit": "", "exclude": ["urine"]},
     "hco3": {"low": 15, "unit": "mmol/L"},
     "wbc": {"high": 20, "unit": "x10^3/uL"},
 }
+
+# Items that should NOT be treated as pending lab results (devices, procedures, etc.)
+NON_LAB_PENDING_KEYWORDS: list[str] = [
+    "cannula", "catheter", "drain", "tube", "line", "suture",
+    "dressing", "bandage", "splint", "brace", "collar",
+    "iv ", "i.v.", "foley", "ryle",
+]
 
 # ─── EXPECTED CONFLICT DETECTIONS (Test Harness) ────────────────────────────────
 
