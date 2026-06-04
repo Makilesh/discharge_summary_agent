@@ -316,7 +316,19 @@ def _call_vision_llm(
                 task_label = f" [{task_type}]" if task_type else ""
                 print(f"  [API] {model_name}{task_label} ...")
                 response = llm.invoke([msg])
-                return response.content
+                # Normalize response content — some Gemini models return a list
+                # of content parts instead of a plain string.
+                raw_content = response.content
+                if isinstance(raw_content, list):
+                    # Extract text from each part; skip non-text parts
+                    text_parts = []
+                    for part in raw_content:
+                        if isinstance(part, str):
+                            text_parts.append(part)
+                        elif isinstance(part, dict) and "text" in part:
+                            text_parts.append(part["text"])
+                    raw_content = "\n".join(text_parts)
+                return raw_content if isinstance(raw_content, str) else str(raw_content)
 
             except Exception as e:
                 error_str = str(e).lower()
