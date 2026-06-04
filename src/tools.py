@@ -1104,6 +1104,8 @@ def reconcile_medications(
         - A medication added without documented reason MUST be flagged.
         - A medication stopped without documented reason MUST be flagged.
         - This function NEVER resolves discrepancies — it reports them.
+        - Empty/blank drug names are filtered out (OCR artifacts).
+        - Near-duplicate names are merged (fuzzy matching at ≥75% similarity).
 
     Returns:
         {"reconciliation": [dict], "flags": [ClinicalFlag-like dicts]}
@@ -1111,15 +1113,120 @@ def reconcile_medications(
     reconciliation: list[dict] = []
     flags: list[dict] = []
 
-    # Normalize medication names for comparison
-    def normalize(name: str) -> str:
-        return name.strip().upper().replace("INJ ", "").replace("TAB ", "").replace("CAP ", "")
+    # ─── NORMALIZE & DEDUP UTILITIES ─────────────────────────────────────────
 
-    adm_names = {normalize(m.get("name", "")): m for m in admission}
-    inp_names = {normalize(m.get("name", "")): m for m in inpatient}
-    dis_names = {normalize(m.get("name", "")): m for m in discharge}
+    _STRIP_PREFIXES = ("INJ ", "INJ. ", "TAB ", "TAB. ", "CAP ", "CAP. ", "SYP ", "SYP. ")
+
+    def normalize(name: str) -> str:
+        """Normalize a medication name: uppercase, strip prefixes, collapse whitespace."""
+        n = name.strip().upper()
+        for prefix in _STRIP_PREFIXES:
+            if n.startswith(prefix):
+                n = n[len(prefix):]
+                break
+        # Collapse dots and extra whitespace: "H.ACTRAPID" → "H ACTRAPID"
+        n = n.replace(".", " ").replace("-", " ")
+        # Collapse multiple spaces
+        n = " ".join(n.split())
+        return n
+
+    def _levenshtein(s1: str, s2: str) -> int:
+        """Compute Levenshtein distance between two strings."""
+        if len(s1) < len(s2):
+            return _levenshtein(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        prev_row = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1):
+            curr_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = prev_row[j + 1] + 1
+                deletions = curr_row[j] + 1
+                subs = prev_row[j] + (c1 != c2)
+                curr_row.append(min(insertions, deletions, subs))
+            prev_row = curr_row
+        return prev_row[-1]
+
+    def _similarity(a: str, b: str) -> float:
+        """Compute normalized similarity between two strings (0.0–1.0)."""
+        if not a or not b:
+            return 0.0
+        max_len = max(len(a), len(b))
+        return 1.0 - (_levenshtein(a, b) / max_len) if max_len > 0 else 1.0
+
+    # ─── BUILD NORMALIZED MEDICATION MAPS ────────────────────────────────────
+
+    def _build_med_map(med_list: list[dict]) -> dict[str, dict]:
+        """Build {normalized_name: med_dict} from a list, filtering blanks."""
+        result = {}
+        for m in med_list:
+            raw_name = (m.get("name") or "").strip()
+            if not raw_name:
+                continue  # Skip blank/empty drug names (OCR artifacts)
+            norm = normalize(raw_name)
+            if not norm:
+                continue
+            result[norm] = m
+        return result
+
+    adm_names = _build_med_map(admission)
+    inp_names = _build_med_map(inpatient)
+    dis_names = _build_med_map(discharge)
+
+    all_drugs_raw = set(adm_names.keys()) | set(inp_names.keys()) | set(dis_names.keys())
+
+    # ─── FUZZY DEDUP: Merge near-duplicate names ─────────────────────────────
+    # e.g., "HAPPY NERVE PLUS" ≈ "HAPPYNERVE PLUS" (similarity > 75%)
+    # e.g., "H ACTRAPID" ≈ "INSULIN H ACTRAPID" (one is substring of the other)
+
+    SIMILARITY_THRESHOLD = 0.75
+    canonical_map: dict[str, str] = {}  # normalized_name → canonical_name
+    canonical_names: list[str] = []
+
+    for drug in sorted(all_drugs_raw):
+        merged = False
+        for canon in canonical_names:
+            # Check fuzzy similarity
+            if _similarity(drug, canon) >= SIMILARITY_THRESHOLD:
+                # Keep the longer/more descriptive name as canonical
+                if len(drug) > len(canon):
+                    # Replace canonical with longer name
+                    canonical_map[canon] = drug
+                    canonical_map[drug] = drug
+                    canonical_names[canonical_names.index(canon)] = drug
+                else:
+                    canonical_map[drug] = canon
+                merged = True
+                break
+            # Also check if one is a substring of the other
+            if drug in canon or canon in drug:
+                longer = drug if len(drug) > len(canon) else canon
+                canonical_map[drug] = longer
+                if longer != canon:
+                    canonical_map[canon] = longer
+                    canonical_names[canonical_names.index(canon)] = longer
+                merged = True
+                break
+        if not merged:
+            canonical_names.append(drug)
+            canonical_map[drug] = drug
+
+    # Rebuild medication maps using canonical names
+    def _remap(med_map: dict[str, dict]) -> dict[str, dict]:
+        remapped: dict[str, dict] = {}
+        for norm, med in med_map.items():
+            canon = canonical_map.get(norm, norm)
+            if canon not in remapped:
+                remapped[canon] = med
+        return remapped
+
+    adm_names = _remap(adm_names)
+    inp_names = _remap(inp_names)
+    dis_names = _remap(dis_names)
 
     all_drugs = set(adm_names.keys()) | set(inp_names.keys()) | set(dis_names.keys())
+
+    # ─── RECONCILE ───────────────────────────────────────────────────────────
 
     for drug in sorted(all_drugs):
         in_adm = drug in adm_names
