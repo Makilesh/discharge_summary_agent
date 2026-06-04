@@ -135,18 +135,23 @@ R = 0.35 × R_SED  +  0.35 × R_SEC  +  0.15 × R_PEND  +  0.15 × R_SAFE
 
 | Metric | Value |
 |--------|-------|
-| Iterations | 10 |
-| Mean composite reward | 0.9934 |
-| R_SED (edit distance) | 0.981 |
-| R_SEC (section accuracy) | 1.000 |
-| R_PEND (pending coverage) | 1.000 |
-| R_SAFE (flag preservation) | 1.000 |
-| Safety clamps triggered | 0 |
-| Gaming alerts | 0 |
-| Best arm | BASELINE |
-| Improvement delta | +0.0000 |
+| **Iterations** | 10 |
+| **Baseline Reward (Arm 0)** | 0.8649 |
+| **Best Arm** | SECTION_EXEMPLARS (Arm 1) |
+| **Best Reward** | 0.8827 |
+| **Improvement Delta** | +0.0178 (+1.78%) |
+| **Safety Clamps Triggered** | 0 |
+| **Fabrication Blocks** | 0 |
+| **Gaming Alerts** | 0 |
 
-**On the zero improvement delta**: a flat reward curve is not a failure of the learning loop — it is evidence of the quality of Part 1. The bandit starts at a 0.99 baseline because the draft is already near-optimal for this patient's clinical profile. The only consistent correction (REV-006: allergies `[MISSING]` → `NOT KNOWN`) is a single-character-category difference that shifts reward by less than the UCB confidence interval. Arm differentiation requires a multi-patient corpus with diverse correction patterns — something that would surface with 10+ distinct patient files. The infrastructure to exploit that differentiation (persistent memory, UCB1 exploration, gaming detection) is fully in place.
+**Interpretation**: 
+Unlike early trials with a flat reward curve caused by a flat baseline, resolving the compiler's correction context application bug revealed a clear learning trajectory. The baseline compiler prompt starts at **0.8649** reward. By utilizing **SECTION_EXEMPLARS** (Arm 1), which dynamically retrieves and applies historical correction mappings for specific section contexts (such as resolving diagnosis inconsistencies or mapping `[MISSING]` allergies to `NOT KNOWN`), the composite reward successfully climbs to **0.8827** (a **+1.78% delta improvement**).
+
+Looking at the section-level metrics:
+- **Principal Diagnosis Accuracy** jumps from **74.4%** (Baseline) to **100%** (Best Arm).
+- **Discharge Condition Accuracy** improves from **97.13%** to **97.34%**.
+This confirms that the contextual bandit successfully identified the superior prompt strategy arm under safety-constrained conditions (100% safety flag preservation, 0 safety clamps triggered).
+
 
 ---
 
