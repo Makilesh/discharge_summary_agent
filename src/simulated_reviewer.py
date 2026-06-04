@@ -548,6 +548,18 @@ def _run_llm_correction_pass(
                 print(f"[REVIEWER] Ollama fallback also failed: {ollama_err}")
                 return accepted_corrections, fabrication_blocks
 
+        # Normalize response_text to string if it is a list
+        if isinstance(response_text, list):
+            text_parts = []
+            for part in response_text:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                elif isinstance(part, dict) and "text" in part:
+                    text_parts.append(part["text"])
+            response_text = "\n".join(text_parts)
+        if not isinstance(response_text, str):
+            response_text = str(response_text)
+
         # Parse JSON response
         response_text = response_text.strip()
         if response_text.startswith("```"):
