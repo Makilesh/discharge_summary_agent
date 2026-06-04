@@ -1,6 +1,6 @@
 # Discharge Summary Agent — Engineering Walkthrough
 
-> A complete account of what was built, why each decision was made, how the system works end-to-end, the bugs we found and fixed, and the final production-grade results.
+> A complete account of what was built, why each decision was made, how the system works end-to-end, the purpose and problem solved by each file, and the final production-grade results.
 
 ---
 
@@ -26,7 +26,7 @@
    - [4.4 Correction Memory Bank](#44-correction-memory-bank)
    - [4.5 Gaming Detector](#45-gaming-detector)
    - [4.6 Learning Loop Orchestrator](#46-learning-loop-orchestrator)
-5. [Production Bugs Found & Fixed](#5-production-bugs-found--fixed)
+5. [File-by-File Purpose & Problems Solved](#5-file-by-file-purpose--problems-solved)
 6. [Test Suite](#6-test-suite)
 7. [Final Results](#7-final-results)
 8. [Project File Map](#8-project-file-map)
@@ -528,97 +528,116 @@ After training, it runs a held-out evaluation with the best arm and produces:
 
 ---
 
-## 5. Production Bugs Found & Fixed
+## 5. File-by-File Purpose & Problems Solved
 
-We ran a comprehensive clinical safety audit and found 5 production-grade bugs. All were fixed and verified.
+This section breaks down the entire codebase file-by-file, outlining the core purpose of each component, the specific clinical or engineering problems it solves, and its design implementations.
 
-### Bug 1 — CR-3 Substring False Positives (21 false CRITICAL alerts)
+### Part 1: The Core Agent (inside `src/`)
 
-**Root cause**: The CR-3 lab threshold matching used Python substring matching:
+#### 1. [config.py](file:///d:/GEN%20AI/discharge_summary_agent/src/config.py)
+* **Purpose**: Serves as the central repository for all static parameters, system prompts, clinical thresholds, model parameters, and templates.
+* **Problems Solved**:
+  * **API Rate Limiting & Overuse**: Distributes the processing workload across multiple Gemini models (`gemini-3.5-flash`, `gemini-3.1-flash-lite`, `gemini-2.5-flash`, and `gemini-3-flash-preview`) by defining strict RPM mappings and fallback routes, preventing model exhaustion.
+  * **Clutter in Clinical Auditing**: Defines `NON_LAB_PENDING_KEYWORDS` (e.g., `"cannula"`, `"catheter"`, `"tube"`, `"drain"`, `"line"`) to filter out physical patient-care devices from pending lab reports, ensuring the auditor focuses solely on clinical investigations.
+  * **Standardized Out-of-Bounds Detection**: Centralizes safety ranges like [CRITICAL_LAB_THRESHOLDS](file:///d:/GEN%20AI/discharge_summary_agent/src/config.py#L218-L227) for sodium, potassium, blood glucose, and pH, ensuring consistent rule execution.
 
-```python
-# BEFORE (broken)
-if threshold_key in test_name:  # "ph" in "neutrophils" → True!
-```
+#### 2. [state.py](file:///d:/GEN%20AI/discharge_summary_agent/src/state.py)
+* **Purpose**: Declares the state schema (`AgentState`) using Python's `TypedDict` and sets up model reducer functions.
+* **Problems Solved**:
+  * **State Overwriting in LangGraph**: Ensures that when different pages are processed asynchronously or sequentially, values are combined rather than overwritten. Annotations like `Annotated[list[...], operator.add]` on clinical list fields allow the agent to continuously accumulate findings (e.g., appending new lab results from different pages).
+  * **Type Mismatches & Data Corruption**: Strongly types medication entries, clinical flags, demographics, and audit logs to prevent data format corruption.
 
-This meant the pH threshold (7.25–7.55) was applied to neutrophil percentages (58%), lymphocyte percentages (32%), eosinophil percentages (2%), and basophil percentages (1%). All of these were flagged as CRITICAL because their percentage values fall outside pH range.
+#### 3. [pdf_processor.py](file:///d:/GEN%20AI/discharge_summary_agent/src/pdf_processor.py)
+* **Purpose**: Handles PDF document loading and converts pages to high-resolution PNG images.
+* **Problems Solved**:
+  * **Multimodal Extraction Support**: Converts scanned clinical papers into a visual format readable by multimodal models (Gemini Vision) to support transcription of handwritten charts and complex tables.
+  * **Memory Overhead**: Performs page-level image extraction on-demand to handle large files (such as 70+ page charts) without causing memory exhaustion.
 
-**Fix**: Word-boundary regex matching in [cross_reference.py](file:///d:/GEN%20AI/discharge_summary_agent/src/cross_reference.py#L431):
+#### 4. [tools.py](file:///d:/GEN%20AI/discharge_summary_agent/src/tools.py)
+* **Purpose**: Implements core execution tools including OCR transcription, page classification, clinical extraction, model invocation with rate-limit throttles, and medication reconciliation.
+* **Problems Solved**:
+  * **Varying Model Output Structures**: Normalizes responses from Gemini models that occasionally return `response.content` as a parts list (`[{"text": "..."}]`) instead of a plain string, preventing string operations from failing.
+  * **OCR Spelling Variants & Medication Redundancy**: Implements a 3-layer deduplication engine (string normalization, Levenshtein distance matching at ≥75%, and substring containment check). This merges handwriting OCR variants (such as `"H.ACTRAPID"` and `"INSULIN H. ACTRAPID"`) to collapse duplicate entries into clean clinical lists.
+  * **Transient API Throttling**: Implements localized RPM throttling and automated fallback mechanisms to handle `HTTP 429` rate-limit exceptions.
 
-```python
-# AFTER (fixed)
-if re.search(rf'(?<![a-z]){re.escape(threshold_key)}(?![a-z])', test):
-```
+#### 5. [cross_reference.py](file:///d:/GEN%20AI/discharge_summary_agent/src/cross_reference.py)
+* **Purpose**: Implements the clinical safety checks (CR-1 to CR-5) that cross-reference extracted data to detect conflicts, medication omissions, abnormal laboratory readings, and inconsistencies in patient status.
+* **Problems Solved**:
+  * **Naive Substring False Positives**: Replaces simple substring matching (which caused 21 false positives by matching `"ph"` in `"neutrophils"`, `"lymphocytes"`, etc.) with strict word-boundary regex checks (`(?<![a-z])ph(?![a-z])`).
+  * **Physiological Context Distinctions**: Supports exclusion overrides in test matching, such as ignoring `"urine"` from blood pH safety checks to prevent normal urine pH readings (e.g., 5.5) from triggering critical warnings.
+  * **Unit Scale Inconsistencies**: Implements automatic unit scale normalization (e.g., converting WBC counts from cells/cumm to cells/µL scale) to perform mathematically accurate comparisons.
+  * **Implicit Contradiction Silencing**: Prevents the agent from deciding on conflicting clinical statements (e.g., diagnosis disagreements between ER notes and the final summary), instead forcing escalation to a human clinician.
 
-Now `"ph"` only matches `"ph"`, `"blood ph"`, `"arterial ph"` — not `"neutrophils"` or `"lymphocytes"`.
+#### 6. [compiler.py](file:///d:/GEN%20AI/discharge_summary_agent/src/compiler.py)
+* **Purpose**: Compiles the final structured Markdown report from the accumulated state.
+* **Problems Solved**:
+  * **Vague and Incomplete Layouts**: Organizes details into a 17-section structured layout with prominent warnings, medication reconciliation tables, and pending laboratory test alerts.
+  * **Unvalidated Use of Drafts**: Appends clear status metadata and clinical disclaimers to ensure AI drafts are marked as unsafe for direct clinical use until reviewed.
 
-**Impact**: 21 false CRITICAL alerts eliminated.
+#### 7. [graph.py](file:///d:/GEN%20AI/discharge_summary_agent/src/graph.py)
+* **Purpose**: Establishes the LangGraph workflow layout, routing logic, node processes, and state transitions.
+* **Problems Solved**:
+  * **Nondeterministic Agent Hallucinations**: Constrains the LLM to a strict state-machine flow (Initialize → Reason → Call Tool → Observe → Verify → Compile/Escalate), preventing it from taking unpredictable actions.
+  * **Processing Resource Exhaustion**: Implements a step budget check that routes the flow to a hard-cap node when steps are depleted, compiling whatever has been extracted with clear `[MISSING]` tags.
 
----
-
-### Bug 2 — Urine pH vs Blood pH
-
-**Root cause**: Even with word-boundary matching, `"urine ph"` would still match the `"ph"` threshold key. But urine pH of 5.5 is clinically normal (range 4.5–8.0), while blood pH of 5.5 would be fatal.
-
-**Fix**: Added `"exclude"` support to [CRITICAL_LAB_THRESHOLDS](file:///d:/GEN%20AI/discharge_summary_agent/src/config.py#L224):
-
-```python
-"ph": {"low": 7.25, "high": 7.55, "unit": "", "exclude": ["urine"]}
-```
-
-The CR-3 logic now checks exclusion patterns before comparing values.
-
-**Impact**: 2 more false CRITICAL alerts eliminated.
-
----
-
-### Bug 3 — WBC Unit Mismatch
-
-**Root cause**: The WBC threshold is defined as 20 × 10³/µL, but the lab report gives raw counts in Cells/cumm (e.g., 7160 Cells/cumm). Without unit normalization, 7160 > 20 → false CRITICAL.
-
-**Fix**: Added unit normalization in [cross_reference.py](file:///d:/GEN%20AI/discharge_summary_agent/src/cross_reference.py#L418-L424):
-
-```python
-if any(kw in test for kw in ("wbc", "total count")) and value > 100:
-    if any(u in unit for u in ("cells", "cumm", "/ul")):
-        comparison_value = value / 1000.0  # 7160 → 7.16
-```
-
-Now 7.16 < 20 → correctly not flagged.
-
----
-
-### Bug 4 — Gemini Response Content as List
-
-**Root cause**: Some Gemini models return `response.content` as a list of content parts (`[{"text": "..."}]`) instead of a plain string. This caused `'list' object has no attribute 'strip'` during page classification.
-
-**Fix**: Added type-checking normalization in [tools.py](file:///d:/GEN%20AI/discharge_summary_agent/src/tools.py#L318-L330):
-
-```python
-if isinstance(raw_content, list):
-    text_parts = [p if isinstance(p, str) else p.get("text", "") for p in raw_content]
-    raw_content = "\n".join(text_parts)
-```
+#### 8. [trace.py](file:///d:/GEN%20AI/discharge_summary_agent/src/trace.py)
+* **Purpose**: Operates the state transition tracer, logging reasoning steps, tool calls, and state changes.
+* **Problems Solved**:
+  * **Black-Box AI Actions**: Records a structured log (like the 108 steps logged for Patient 2) of every model reasoning process and output routing, providing full audibility.
 
 ---
 
-### Bug 5 — Medication Deduplication & Empty Names
+### Part 2: Doctor Edit Feedback & Learning Loop (inside `src/`)
 
-**Root cause**: OCR artifacts produced blank medication names and near-duplicate spellings.
+#### 9. [bandit.py](file:///d:/GEN%20AI/discharge_summary_agent/src/bandit.py)
+* **Purpose**: Implements the UCB1 contextual bandit strategy selector and the reward-hacking detector (`GamingDetector`).
+* **Problems Solved**:
+  * **Compilation Strategy Optimization**: Balances exploration and exploitation across 5 prompt strategy arms to find the prompt layout that requires the fewest clinician corrections.
+  * **Reward Hacking / Vagueness Gaming**: Monitors changes in narrative length and section accuracy to detect if the agent is outputting shorter, vaguer summaries to artificially lower edit distance.
 
-**Fix**: Two changes:
-1. Filter out blank/empty drug names before processing.
-2. Implemented the 3-layer fuzzy dedup pipeline (normalize → Levenshtein ≥ 75% → substring containment).
+#### 10. [edit_signal.py](file:///d:/GEN%20AI/discharge_summary_agent/src/edit_signal.py)
+* **Purpose**: Evaluates candidate drafts against final doctor-corrected summaries to calculate a weighted reward score.
+* **Problems Solved**:
+  * **Safety Flag Dropping**: Addresses the risk of mathematical optimization ignoring critical clinical warnings. Implements a hard safety clamp that penalizes the reward if any safety flag or conflict warning is removed from the draft.
 
-**Impact**: 20 raw entries → 16 unique medications. No duplicate or ghost entries.
+#### 11. [simulated_reviewer.py](file:///d:/GEN%20AI/discharge_summary_agent/src/simulated_reviewer.py)
+* **Purpose**: Emulates human clinician reviews via a clinical correction prompt and seven pattern-matching rules (REV-001 to REV-007).
+* **Problems Solved**:
+  * **Data Feedback Bottlenecks**: Avoids the high cost and latency of querying human clinicians during early-stage training iterations.
+
+#### 12. [correction_memory.py](file:///d:/GEN%20AI/discharge_summary_agent/src/correction_memory.py)
+* **Purpose**: Coordinates a persistent JSONL store of past clinician corrections, indexing and retrieving relevant exemplars.
+* **Problems Solved**:
+  * **Static In-Context Learning**: Provides long-term memory of past corrections, feeding them back as examples to prevent the model from repeating compilation mistakes.
+
+#### 13. [learning_loop.py](file:///d:/GEN%20AI/discharge_summary_agent/src/learning_loop.py)
+* **Purpose**: Runs the contextual bandit learning loop across multiple training cycles.
+* **Problems Solved**:
+  * **Loop Orchestration Overhead**: Integrates file saving/loading, model calls, memory retrieval, and reward logging into a single automated pipeline.
 
 ---
 
-### Bug 6 — Non-Lab Items in Pending Results
+### Root Executables & Tests
 
-**Root cause**: "IV CANNULA" was being flagged as a pending investigation result.
+#### 14. [run_agent.py](file:///d:/GEN%20AI/discharge_summary_agent/run_agent.py)
+* **Purpose**: Provides the CLI command-line entry point to execute the Part 1 LangGraph agent on raw patient PDFs.
+* **Problems Solved**:
+  * **Command Line Accessibility**: Allows developers and operators to run the pipeline with flexible arguments (paths, caches, custom models).
 
-**Fix**: Added [NON_LAB_PENDING_KEYWORDS](file:///d:/GEN%20AI/discharge_summary_agent/src/config.py#L230-L234) (cannula, catheter, drain, tube, etc.) and filtered them in CR-3 before escalation.
+#### 15. [run_learning.py](file:///d:/GEN%20AI/discharge_summary_agent/run_learning.py)
+* **Purpose**: Provides the CLI entry point to run the Part 2 reinforcement learning training and evaluation loop.
+* **Problems Solved**:
+  * **Training Execution**: Streamlines learning runs and generates visualization curves.
+
+#### 16. [tests/test_agent.py](file:///d:/GEN%20AI/discharge_summary_agent/tests/test_agent.py)
+* **Purpose**: Implements 35 unit tests checking LangGraph nodes, cross-reference rules, medication reconciliation, and OCR caching.
+* **Problems Solved**:
+  * **Regression Risks**: Validates that changes to extraction engines or formatting templates do not compromise clinical auditing logic.
+
+#### 17. [tests/test_part2.py](file:///d:/GEN%20AI/discharge_summary_agent/tests/test_part2.py)
+* **Purpose**: Implements 21 unit tests checking UCB1 selection, simulated reviews, memory storage, and gaming checks.
+* **Problems Solved**:
+  * **Optimization Calculation Errors**: Confirms the math behind edit distance, rewards, UCB formulas, and memory lookups remains sound.
 
 ---
 
@@ -652,7 +671,7 @@ All 56 tests pass. Run time: ~23 seconds.
 
 ### Patient 2 — 71 Pages, 15 Document Types
 
-| Metric | Early Build | After CR-3 Fix | **Production Grade** |
+| Metric | Unoptimized Matching (Baseline) | With Context-Aware Matching | **Optimized Pipeline (Final)** |
 |---|---|---|---|
 | **Conflicts** | 27 | 6 | **3** |
 | **Escalation flags** | 45 | 24 | **18** |
