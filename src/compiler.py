@@ -14,6 +14,7 @@ Clinical Safety:
 """
 
 from __future__ import annotations
+import re
 from typing import Optional
 
 from .config import (
@@ -23,6 +24,76 @@ from .config import (
     UNCLEAR_FIELD_TEMPLATE,
 )
 from .trace import validate_state_completeness, generate_trace_summary
+
+
+def _apply_correction_context(summary: str, correction_context: str) -> str:
+    """
+    Parse BEFORE/AFTER correction patterns from the correction context
+    and apply them as text replacements to the compiled summary.
+
+    Purpose:
+        Closes the learning loop — corrections learned from prior reviewer
+        edits actually modify subsequent drafts, allowing the bandit to
+        observe reward differences between arms.
+
+    Args:
+        summary: The compiled Markdown summary.
+        correction_context: A string block containing one or more
+            BEFORE: <text>\nAFTER: <text> pairs.
+
+    Returns:
+        The summary with applicable corrections applied.
+
+    Safety Constraint:
+        Only applies exact text replacements. Never modifies template
+        tokens like [MISSING], [CONFLICT], [PENDING], [UNCLEAR].
+        Corrections that target safety-critical template strings are
+        skipped to preserve Part 1 safety invariants.
+
+    Failure Behavior:
+        If no patterns match or parsing fails, returns the original
+        summary unchanged. Never raises.
+    """
+    if not correction_context or not summary:
+        return summary
+
+    # Protected tokens that corrections must NEVER remove
+    protected_tokens = [
+        "[MISSING",
+        "[CONFLICT",
+        "[PENDING",
+        "[UNCLEAR",
+        "DRAFT — NOT FOR CLINICAL USE",
+        "⚠️ Escalation Flags",
+    ]
+
+    # Parse BEFORE: ... AFTER: ... pairs
+    pattern = r'BEFORE:\s*(.*?)\nAFTER:\s*(.*?)(?:\n(?:CORRECTION EXAMPLE|$)|\Z)'
+    matches = re.findall(pattern, correction_context, re.DOTALL)
+
+    applied_count = 0
+    for before_text, after_text in matches:
+        before_text = before_text.strip()
+        after_text = after_text.strip()
+
+        if not before_text or not after_text:
+            continue
+
+        # Safety guard: skip corrections that would remove protected tokens
+        removes_protected = False
+        for token in protected_tokens:
+            if token in before_text and token not in after_text:
+                removes_protected = True
+                break
+        if removes_protected:
+            continue
+
+        # Apply the correction (first occurrence only)
+        if before_text in summary:
+            summary = summary.replace(before_text, after_text, 1)
+            applied_count += 1
+
+    return summary
 
 
 def compile_discharge_summary(state: dict, correction_context: str = "") -> str:
@@ -62,9 +133,10 @@ def compile_discharge_summary(state: dict, correction_context: str = "") -> str:
     sections.append("")
 
     # ─── CORRECTION CONTEXT (Part 2 Learning Loop) ───────────────────────────
+    # Correction patterns are applied AFTER full assembly (see below).
+    # Store the context for audit trail only.
     if correction_context:
-        sections.append("<!-- CORRECTION GUIDANCE (Part 2 Learning Loop) -->")
-        sections.append(f"<!-- {correction_context[:2000]} -->")
+        sections.append("<!-- CORRECTION GUIDANCE ACTIVE -->")
         sections.append("")
 
     # ─── 1. PATIENT DEMOGRAPHICS ─────────────────────────────────────────────
@@ -385,7 +457,15 @@ def compile_discharge_summary(state: dict, correction_context: str = "") -> str:
         for f in fab:
             sections.append(f"  - {f}")
 
-    return "\n".join(sections)
+    summary = "\n".join(sections)
+
+    # Apply learned correction patterns from the bandit's correction memory.
+    # This is the mechanism that closes the learning loop: corrections extracted
+    # from reviewer edits in prior iterations modify the compiled output here.
+    if correction_context:
+        summary = _apply_correction_context(summary, correction_context)
+
+    return summary
 
 
 def _render_medication_table(sections: list[str], medications: list[dict]) -> None:
