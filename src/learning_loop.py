@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, asdict
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -281,6 +282,10 @@ class LearningOrchestrator:
             except Exception as e:
                 print(f"  Iteration {i:2d} | ERROR: {e}")
 
+            # Rate limit delay — respect Free Tier RPM constraints
+            if i < self.n_train:
+                time.sleep(4)
+
         return self.training_records
 
     def _run_single_iteration(self, iteration: int) -> IterationRecord:
@@ -462,6 +467,7 @@ class LearningOrchestrator:
                     "r_safe": r.r_safe,
                     "safety_clamped": r.safety_clamped,
                     "section_scores": r.section_scores,
+                    "rules_applied": r.rules_applied,
                 }
                 for r in self.training_records
             ]
