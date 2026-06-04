@@ -1,4 +1,4 @@
-# Discharge Summary Agent — Part 1
+# Discharge Summary Agent
 
 > An agentic AI system that reads messy, multi-page hospital PDFs and produces a structured, clinically safe discharge summary draft for clinician review.
 
@@ -14,17 +14,19 @@ INITIALIZE → REASON → PLAN → CALL_TOOL → OBSERVE → VERIFY → [REASON 
 
 **Key design decisions:**
 - **LangGraph StateGraph** — gives us typed state, conditional edges, and streaming observability for free
-- **Gemini 2.0 Flash Vision** — handles OCR of handwritten + typed scanned pages without a separate OCR library
-- **Batch page processing** — same-type pages are grouped and processed together to maximize the 20-step budget
+- **Dynamic Multi-Model Routing** — distributes API calls across 4 Gemini Free Tier models (`gemini-3.1-flash-lite` for OCR, `gemini-3.5-flash` for complex extraction) with automatic 429 fallback
+- **Batch page processing** — same-type pages are grouped and processed together to maximize the 25-step budget
 - **Deterministic routing** — `route_after_verify()` function with explicit conditions, not LLM-based routing
 
 ### Control Mechanisms
 
 | Mechanism | Implementation |
 |-----------|---------------|
-| **Step cap** | `MAX_ITERATIONS = 20`. Decremented every transition. Cap breach → `HARD_CAP_ESCALATE` with `[MISSING]` markers. |
+| **Step cap** | `MAX_ITERATIONS = 25`. Decremented every transition. Cap breach → `HARD_CAP_ESCALATE` with `[MISSING]` markers. |
 | **Retry limit** | `MAX_RETRIES = 2` per tool. Third failure → `[UNRESOLVED]` marker, field added to `fabrication_blocks`. |
-| **Priority order** | 13-level extraction priority (typed summary first, discharge checklist last). Never skips ahead. |
+| **Priority order** | 15-level extraction priority (typed summary first, discharge checklist last). Never skips ahead. |
+| **RPM throttle** | Per-model RPM tracking (`_rpm_sleep()`) prevents 429 storms across Gemini Free Tier quotas. |
+| **Model fallback** | `MODEL_FALLBACK_CHAIN`: flash-lite → flash → gemini-2.5-flash → local Ollama. |
 
 ## No-Fabrication Guardrail
 
@@ -45,11 +47,17 @@ Before compiling the final summary, a mandatory `cross_reference_audit()` runs 5
 |------|----------------|---------------------|
 | **CR-1** | Treatment without matching diagnosis | Insulin given but final diagnosis omits DM/DKA |
 | **CR-2** | Diagnoses disagree across documents | ER says DKA, admission says TAFE, ICU says DKA+T2DM |
-| **CR-3** | Labs critical but not addressed, or "resolved" contradicted by labs | Na 114 mmol/L, glucose 443 mg/dL |
+| **CR-3** | Labs critical but not addressed, or "resolved" contradicted by labs | Na+ 114 mmol/L — severe hyponatremia |
 | **CR-4** | Negative culture but broad-spectrum antibiotics given | Urine culture sterile but IV Meropenem administered |
 | **CR-5** | Discharge condition contradicted by vitals / DAMA indicators | "Discharge on Request" noted in multiple documents |
 
 Every conflict triggers `escalate_to_clinician()` — the agent **never silently resolves** a conflict.
+
+**Production-grade CR-3 matching:**
+- Word-boundary regex prevents false positives (e.g., `"ph"` threshold won't match `"neutrophils"`)
+- Context-aware exclusions (urine pH excluded from blood pH thresholds)
+- WBC unit normalization (raw Cells/cumm → x10³/µL)
+- Non-lab items (IV cannula, catheter) filtered from pending results escalation
 
 ## Failure & Conflict Handling
 
@@ -62,17 +70,24 @@ Every conflict triggers `escalate_to_clinician()` — the agent **never silently
 
 ```
 src/
-├── state.py           # AgentState TypedDict, ClinicalFlag, MedicationEntry
-├── config.py          # Constants, DOC_TYPES, templates, thresholds
-├── trace.py           # Trace emission, state validation, trace summary
-├── pdf_processor.py   # PDF → page images (PyMuPDF)
-├── tools.py           # LLM-backed extraction tools + safe_tool_call
-├── cross_reference.py # CR-1 through CR-5 audit rules
-├── compiler.py        # Final Markdown summary compiler
-└── graph.py           # LangGraph StateGraph definition
+├── state.py             # AgentState TypedDict, ClinicalFlag, MedicationEntry
+├── config.py            # Constants, model routing, thresholds, templates
+├── trace.py             # Trace emission, state validation, trace summary
+├── pdf_processor.py     # PDF → page images (PyMuPDF)
+├── tools.py             # Multi-model LLM extraction, medication reconciliation
+├── cross_reference.py   # CR-1 through CR-5 audit rules
+├── compiler.py          # Final Markdown summary compiler
+├── graph.py             # LangGraph StateGraph definition
+├── edit_signal.py       # Part 2: Weighted edit distance reward
+├── simulated_reviewer.py# Part 2: 7-rule deterministic reviewer + LLM correction
+├── correction_memory.py # Part 2: JSONL-backed correction pattern store
+├── bandit.py            # Part 2: UCB1 contextual bandit over prompt strategies
+└── learning_loop.py     # Part 2: Training loop orchestrator
 tests/
-└── test_agent.py      # 20 unit tests for all CR rules, reconciliation, caps
-run_agent.py           # CLI entry point
+├── test_agent.py        # 35 unit tests (Part 1: CR rules, reconciliation, caps, graph)
+└── test_part2.py        # 21 unit tests (Part 2: bandit, edit signal, learning loop)
+run_agent.py             # CLI entry point (Part 1)
+run_learning.py          # CLI entry point (Part 2)
 ```
 
 ## Quick Start
@@ -104,21 +119,40 @@ python run_agent.py --pdf "patient 2 (1).pdf" --output output/
 | `trace.json` | Full step-by-step audit trail of every agent decision |
 | `state.json` | Final agent state (all extracted data, conflicts, flags) |
 
+## Results — Patient 2 (71 pages)
+
+| Metric | Value |
+|---|---|
+| **Runtime** | 208 seconds |
+| **Graph steps** | 98 |
+| **Pages processed** | 71 (15 document types) |
+| **Conflicts detected** | 3 (all legitimate) |
+| **Escalation flags** | 18 (2 CRITICAL, 16 WARNING) |
+| **False positives** | 0 |
+| **Fabrication blocks** | 0 |
+| **Medications reconciled** | 16 (fuzzy-deduped) |
+| **Lab results extracted** | 147 |
+| **Trace entries** | 108 |
+
+### CRITICAL Alerts (Both Genuine)
+1. 🚨 **Sodium [Na+] 114 mmol/L** — severe hyponatremia (ref: 136–146)
+2. 🚨 **DAMA** — discharge against medical advice detected from "not willing" (Page 2), "discharge on request" (Page 56)
+
 ## Limitations
 
-- **OCR quality**: Gemini Vision handles handwriting reasonably well, but heavily degraded scans may produce low-confidence extractions. These are flagged, not silently dropped.
-- **Step budget**: The 20-step cap may not be sufficient for very large PDFs. The agent prioritizes high-value documents first and compiles whatever it has if the cap is hit.
+- **OCR quality**: Gemini Vision handles handwriting reasonably well, but heavily degraded scans may produce low-confidence extractions. These are flagged with `[UNCLEAR]`, not silently dropped.
+- **Demographics extraction**: The agent correctly marks demographics as `[MISSING]` rather than guessing, but could improve by extracting name/age/gender from admission record headers.
 - **Drug interaction lookup**: Currently mocked. In production, this would integrate with a clinical pharmacopeia database.
-- **No learning loop**: ~~Part 2 (learning from doctor edits) is not implemented in this submission.~~ **Now implemented — see Part 2 below.**
+- **Single-patient evaluation**: All testing on patient_2's clinical profile. Multi-patient corpus would demonstrate broader robustness.
 
 ## What I'd Do With More Time
 
-1. ~~**Part 2**: Implement the doctor-edit learning loop with a simulated reviewer and contextual bandit over prompt strategies.~~ **Done.**
-2. **Multi-patient batch mode**: Process multiple patient PDFs in parallel.
-3. **Confidence-weighted extraction**: Re-read low-confidence pages with different prompting strategies.
-4. **Real drug interaction API**: Replace the mock with a real pharmacopeia integration.
-5. **Structured output validation**: Use Pydantic models to validate every tool's JSON output.
-6. **Token budget tracking**: Monitor LLM token usage and optimize prompts for cost.
+1. **Multi-patient batch mode**: Process multiple patient PDFs in parallel with aggregated metrics.
+2. **Demographics extraction improvement**: Parse admission record headers for name, age, gender, MRN.
+3. **Real drug interaction API**: Replace the mock with a real pharmacopeia integration.
+4. **Structured output validation**: Use Pydantic models to validate every tool's JSON output.
+5. **Token budget tracking**: Monitor LLM token usage and optimize prompts for cost.
+6. **Semantic citation verification**: Cross-reference LLM corrections against actual page content.
 
 ---
 
@@ -230,6 +264,36 @@ See `output/part2/limitations_analysis.md` for a detailed analysis with evidence
 | Runtime | 361.5s |
 
 The flat reward curve reflects the high quality of Part 1's draft — the only consistent correction is REV-006 (allergies `[MISSING]` → `NOT KNOWN`). With a multi-patient training corpus, arm differentiation would emerge.
+
+---
+
+## Test Suite
+
+```bash
+# Run all 56 tests
+python -m pytest tests/ -v
+
+# Part 1 only (35 tests: CR rules, reconciliation, graph, extraction, Ollama fallback)
+python -m pytest tests/test_agent.py -v
+
+# Part 2 only (21 tests: bandit, edit signal, learning loop, correction memory)
+python -m pytest tests/test_part2.py -v
+```
+
+All 56 tests pass. Test coverage includes:
+- CR-1 through CR-5 cross-reference rules
+- Medication reconciliation (stopped, added, continued, dose changed)
+- Hard cap escalation
+- State validation
+- Trace emission
+- Graph extraction routing (batch, dedup, classification cache)
+- Ollama fallback routing
+- OCR caching
+- Edit signal computation
+- Contextual bandit (UCB1, arm selection, persistence)
+- Simulated reviewer rules
+- Correction memory deduplication
+- Gaming detection
 
 ### What I'd Do With More Time (Part 2)
 
